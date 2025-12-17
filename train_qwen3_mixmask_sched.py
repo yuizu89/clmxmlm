@@ -2,37 +2,30 @@
 # -*- coding: utf-8 -*-
 """
 Qwen3 (0.6B〜8B) 継続学習: CLM + bidir（MNTP等価, 100/0/0）
-- 目的切替:
-    (A) --mask_policy both       : 同一バッチで causal と bidir を実行し平均損失で更新
-    (B) --mask_policy alternate  : 指定順で目的を循環（micro or step 単位）
-- bidir: 選択トークンは必ず [MASK]（100/0/0）。損失は「右の真値 x_i を左 i-1 で予測」。
-- 注意: bidir（=双方向注意）は **PyTorch FlexAttention** 経由でのみ安全に実現。
-        → attn_impl が flex_attention 以外のときに bidir を使おうとしたらエラーで止めます。
-- 計測: loss / loss_causal / loss_bidir / tokens/sec(active, global) / TFLOPs(global) /
-        lr / grad_norm(global) / update_to_weight / 勾配類似度(任意) /
-        GPUメモリ / fwd,bwd,optim 時間 / host待ち時間
-- 保存: save_pretrained（Accelerate 経由; FSDP/ZeRO対応）
-依存: torch>=2.6, transformers>=4.57, accelerate>=0.33
++ FineWeb (HF datasets) 対応: ストリーミング読込→分散シャード→固定長トークンパック
+
+依存:
+  pip install torch>=2.6 accelerate>=0.33 transformers>=4.57 datasets>=3
 """
 
-import os, time, math, argparse
-from typing import List, Dict, Tuple
+import os, time, math, argparse, random
+from typing import List, Dict, Tuple, Iterator, Optional
 import torch
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from accelerate import Accelerator
 from accelerate.utils import DistributedType
 from accelerate.logging import get_logger
 from transformers import AutoTokenizer, Qwen3ForCausalLM, get_cosine_schedule_with_warmup
 
-# ---- attention masks ----
+# =============== Attention masks ===============
 def causal_mask(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx  # 因果（下三角）
+    return q_idx >= kv_idx  # 因果
 
 def full_visible_mask(b, h, q_idx, kv_idx):
-    return torch.ones_like(q_idx >= 0, dtype=torch.bool)  # 双方向（全可視）
+    return torch.ones_like(q_idx >= 0, dtype=torch.bool)  # 双方向
 
-# ---- toy dataset / collator (CLM 用の右シフト) ----
+# =============== Toy dataset (従来) ===============
 class ToyIDs(Dataset):
     def __init__(self, vocab_size=32000, n=10000, seqlen=2048, seed=7):
         g = torch.Generator().manual_seed(seed)
@@ -40,14 +33,105 @@ class ToyIDs(Dataset):
     def __len__(self): return len(self.data)
     def __getitem__(self, i): return {"input_ids": self.data[i]}
 
-def simple_collate(batch, pad_id=0):
+# =============== FineWeb Packed IterableDataset ===============
+"""
+方針:
+- HF datasets から streaming=True でテキスト列を読む
+- 各ドキュメントを tokenize(add_special_tokens=False) → 末尾に EOS を1個挿入（文書境界の手がかり）
+- 連結バッファに貯め、seqlen ごとにスライスして 1 サンプルとして吐く（固定長パック）
+- 分散: ds.shard(num_shards=world_size, index=rank) でノード間を分割
+- 乱択: datasets 側の .shuffle(buffer_size, seed) を利用（ストリーミング）
+"""
+
+class FineWebPackedIterable(IterableDataset):
+    def __init__(
+        self,
+        *,
+        hf_name: str,
+        hf_config: Optional[str],
+        hf_split: str,
+        tokenizer: AutoTokenizer,
+        seqlen: int,
+        world_size: int,
+        rank: int,
+        text_key: str = "text",
+        streaming: bool = True,
+        shuffle_buffer: int = 10_000,
+        seed: int = 42,
+        cache_dir: Optional[str] = None,
+        add_eos_between_docs: bool = True,
+    ):
+        super().__init__()
+        self.hf_name = hf_name
+        self.hf_config = hf_config
+        self.hf_split = hf_split
+        self.tokenizer = tokenizer
+        self.seqlen = seqlen
+        self.world_size = max(1, world_size)
+        self.rank = max(0, rank)
+        self.text_key = text_key
+        self.streaming = streaming
+        self.shuffle_buffer = shuffle_buffer
+        self.seed = seed
+        self.cache_dir = cache_dir
+        self.add_eos_between_docs = add_eos_between_docs
+
+        assert tokenizer.eos_token_id is not None, "tokenizer に eos_token が必要です。"
+
+    def _hf_iter(self):
+        from datasets import load_dataset
+        ds = load_dataset(
+            self.hf_name,
+            self.hf_config if self.hf_config else None,
+            split=self.hf_split,
+            streaming=self.streaming,
+            cache_dir=self.cache_dir,
+        )
+        # 分散シャーディング（各 rank に異なるストリームを割当て）
+        if hasattr(ds, "shard"):
+            ds = ds.shard(num_shards=self.world_size, index=self.rank)
+        # ストリーミングシャッフル（大きめのバッファ推奨）
+        if hasattr(ds, "shuffle") and self.shuffle_buffer > 0:
+            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
+        return ds
+
+    def _tokenize_text(self, txt: str) -> List[int]:
+        # add_special_tokens=False: あとで doc 間に eos を明示的に挿入
+        ids = self.tokenizer(txt, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+        if not isinstance(ids, list): ids = list(ids)
+        return ids
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        rng = random.Random(self.seed + self.rank)
+        eos = self.tokenizer.eos_token_id
+        buf: List[int] = []
+
+        # 反復ストリーム
+        for ex in self._hf_iter():
+            txt = ex[self.text_key]
+            if not isinstance(txt, str) or len(txt) == 0:
+                continue
+            ids = self._tokenize_text(txt)
+            if self.add_eos_between_docs:
+                ids = ids + [eos]
+            # 連結
+            buf.extend(ids)
+
+            # 固定長で吐く
+            while len(buf) >= self.seqlen:
+                chunk = buf[:self.seqlen]
+                buf = buf[self.seqlen:]
+                yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
+
+# =============== collator（CLM用の右シフト） ===============
+def clm_collate(batch, pad_id=0):
     ids = torch.stack([ex["input_ids"] for ex in batch], dim=0)
     labels = ids.clone()
     labels[:, :-1] = ids[:, 1:]
     labels[:, -1] = -100
     return {"input_ids": ids, "labels": labels}
 
-# ---- distributed-safe helpers ----
+# =============== distributed-safe utils ===============
 def allreduce_sum_scalar(x: float, device=None) -> float:
     t = torch.tensor([x], device=device or ("cuda" if torch.cuda.is_available() else "cpu"), dtype=torch.float32)
     if dist.is_initialized():
@@ -96,7 +180,7 @@ def grad_cosine_similarity_from_losses(model, loss_a, loss_b) -> float:
 def parse_list(s: str) -> List[str]:
     return [t.strip() for t in s.split(",") if t.strip()]
 
-# ---- save (Accelerate/FSDP safe) ----
+# =============== save (Accelerate/FSDP safe) ===============
 def save_hf_checkpoint(accelerator: Accelerator, model, tokenizer, outdir: str, tag: str):
     accelerator.wait_for_everyone()
     state_dict = accelerator.get_state_dict(model)
@@ -108,7 +192,7 @@ def save_hf_checkpoint(accelerator: Accelerator, model, tokenizer, outdir: str, 
         tokenizer.save_pretrained(save_dir)
     accelerator.wait_for_everyone()
 
-# ---- bidir views (MNTP等価, 100/0/0) ----
+# =============== bidir views (MNTP等価, 100/0/0) ===============
 def make_bidir_views(
     input_ids: torch.Tensor,
     *,
@@ -121,23 +205,20 @@ def make_bidir_views(
     labels[:, t] は (t+1) が選ばれている場合のみ x_{t+1}、それ以外は -100。
     戻り値: (masked_input_ids, labels, active_count)
     """
-    device = input_ids.device
     B, S = input_ids.shape
     labels = torch.full_like(input_ids, -100)
-
     mask_id = tokenizer.mask_token_id
-    assert mask_id is not None, "mask_token_id がありません。'<mask>' を追加し model を resize 済みである必要があります。"
+    assert mask_id is not None, "tokenizer に '<mask>' が必要です。"
 
     eligible = torch.ones_like(input_ids, dtype=torch.bool)
-    eligible[:, 0] = False  # i-1 が存在しない先頭は除外
+    eligible[:, 0] = False  # i-1 が無い先頭は除外
     if exclude_special:
         for tid in [tokenizer.pad_token_id, tokenizer.eos_token_id,
                     tokenizer.bos_token_id, tokenizer.unk_token_id, mask_id]:
             if tid is not None:
                 eligible &= (input_ids != tid)
 
-    to_mask = (torch.rand_like(input_ids.float()) < mask_ratio) & eligible  # (B,S)
-
+    to_mask = (torch.rand_like(input_ids.float()) < mask_ratio) & eligible
     active_count = 0
     if S > 1:
         m_right = to_mask[:, 1:]
@@ -152,7 +233,7 @@ def make_bidir_views(
 
     return x, labels, active_count
 
-# ---- main ----
+# =============== main ===============
 def main():
     ap = argparse.ArgumentParser()
     # 基本
@@ -176,32 +257,38 @@ def main():
     ap.add_argument("--alt_unit", choices=["micro", "step"], default="micro")
 
     # bidir
-    ap.add_argument("--bidir_ratio", type=float, default=0.2,
-                    help="入力から“予測対象”に選ぶ割合（先頭位置は除外）")
+    ap.add_argument("--bidir_ratio", type=float, default=0.2)
     ap.add_argument("--bidir_exclude_special", action="store_true", default=True)
 
-    # 保存
+    # データ選択
+    ap.add_argument("--data_source", choices=["toy", "fineweb"], default="fineweb")
+    # FineWeb 仕様
+    ap.add_argument("--hf_name", type=str, default="HuggingFaceFW/fineweb-edu",
+                    help="HF datasets 名。例: HuggingFaceFW/fineweb, HuggingFaceFW/fineweb-edu など")
+    ap.add_argument("--hf_config", type=str, default=None, help="必要ならコンフィグ名（例: 'sample', 'cc-net-v1' 等）")
+    ap.add_argument("--hf_split", type=str, default="train")
+    ap.add_argument("--hf_text_key", type=str, default="text")
+    ap.add_argument("--hf_streaming", action="store_true", default=True)
+    ap.add_argument("--hf_shuffle_buffer", type=int, default=10000)
+    ap.add_argument("--hf_cache_dir", type=str, default=None)
+
+    # 保存/計測
     ap.add_argument("--output_dir", type=str, default="ckpt_out")
     ap.add_argument("--save_every", type=int, default=0)
-
-    # 測定
     ap.add_argument("--report_every", type=int, default=20)
     ap.add_argument("--gpu_peak_tflops", type=float, default=None)
     ap.add_argument("--profile_timing", action="store_true")
-
-    # 勾配類似度（任意）
     ap.add_argument("--grad_sim_every", type=int, default=0)
     ap.add_argument("--grad_sim_pair", default="causal,bidir")
 
-    # データ（デモ）
-    ap.add_argument("--dataset", default="toy", choices=["toy"])
-
     args = ap.parse_args()
 
-    # ★ grad_accum を Accelerator に反映（以前は未適用だった）
+    # Accelerator（grad_accumを適用）
     accelerator = Accelerator(log_with=None, gradient_accumulation_steps=args.grad_accum)
     logger = get_logger(__name__, log_level="INFO")
     is_main = accelerator.is_main_process
+    world_size = accelerator.num_processes
+    rank = accelerator.process_index
 
     # tokenizer（[MASK] を保証）
     tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
@@ -212,7 +299,7 @@ def main():
         tok.add_special_tokens({"mask_token": "<mask>"})
         added_mask = True
 
-    # model 準備と attn_impl の可用性チェック
+    # model & attention backend
     dtype = torch.bfloat16 if args.bf16 and torch.cuda.is_available() else torch.float32
     attn_impl = args.attn_impl
     flex_available = False
@@ -223,22 +310,16 @@ def main():
         except Exception:
             flex_available = False
 
-    # bidir を使う計画かどうか（CLIから早期判定）
     wants_bidir = ("bidir" in parse_list(args.both_masks)) or ("bidir" in parse_list(args.alternate_order))
-
-    # flex が必要なのに無い場合は、ここで明確に停止（サイレント劣化を防ぐ）
     if wants_bidir and not flex_available:
         raise RuntimeError(
-            "bidir（双方向注意）は flex_attention が必要ですが、環境で見つかりませんでした。\n"
-            "PyTorch>=2.6 の FlexAttention を有効にするか、--alternate_order を causal のみへ変更してください。"
+            "bidir（双方向注意）は FlexAttention があると安全に切替できます。"
+            "今は見つからないため、--attn_impl flex_attention を有効にするか、bidir をオフにしてください。"
         )
-
-    # 実際の attn_impl を決定（bidir を使わないならフォールバック可）
     if attn_impl == "flex_attention" and not flex_available:
-        # bidir 不要なら sdpa にフォールバックして続行
         attn_impl = "sdpa"
         if is_main:
-            print("[warn] flex_attention が見つからないため sdpa にフォールバックします（bidir は無効化してください）。")
+            print("[warn] flex_attention が見つからないため sdpa にフォールバックします。")
 
     base_model = Qwen3ForCausalLM.from_pretrained(
         args.model_id, torch_dtype=dtype, attn_implementation=attn_impl, use_cache=False
@@ -251,27 +332,45 @@ def main():
     opt = torch.optim.AdamW(base_model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     sch = get_cosine_schedule_with_warmup(opt, args.warmup_steps, args.max_steps)
 
-    # data
-    if args.dataset == "toy":
+    # dataset
+    if args.data_source == "toy":
         ds = ToyIDs(seqlen=args.seqlen)
-    else:
-        raise NotImplementedError("実データへ差し替えてください。")
+        num_workers = 4
+        collate = clm_collate
+        dl = DataLoader(
+            ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
+            collate_fn=lambda b: collate(b, pad_id=tok.pad_token_id or 0),
+            pin_memory=torch.cuda.is_available(), num_workers=num_workers, persistent_workers=True
+        )
+    else:  # fineweb
+        ds = FineWebPackedIterable(
+            hf_name=args.hf_name,
+            hf_config=args.hf_config,
+            hf_split=args.hf_split,
+            tokenizer=tok,
+            seqlen=args.seqlen,
+            world_size=world_size,
+            rank=rank,
+            text_key=args.hf_text_key,
+            streaming=args.hf_streaming,
+            shuffle_buffer=args.hf_shuffle_buffer,
+            seed=1337,
+            cache_dir=args.hf_cache_dir,
+            add_eos_between_docs=True,
+        )
+        # IterableDataset は worker による並列は非推奨（HF streaming と相性NG）
+        dl = DataLoader(
+            ds, batch_size=args.batch_size, shuffle=False, drop_last=True,
+            collate_fn=lambda b: clm_collate(b, pad_id=tok.pad_token_id or 0),
+            pin_memory=torch.cuda.is_available(), num_workers=0
+        )
 
-    dl = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        collate_fn=lambda b: simple_collate(b, pad_id=tok.pad_token_id or 0),
-        pin_memory=torch.cuda.is_available(),
-        num_workers=4,
-        persistent_workers=True,
-    )
-
-    # prepare
+    # prepare (DDP/FSDP)
     model, opt, dl, sch = accelerator.prepare(base_model, opt, dl, sch)
     if is_main:
         print(f"#params: {n_params_total/1e6:.1f} M, attn_impl={attn_impl}, flex_ok={flex_available}, mask_token_id={tok.mask_token_id}")
+        if args.data_source == "fineweb":
+            print(f"FineWeb: name={args.hf_name}, config={args.hf_config}, split={args.hf_split}, text_key={args.hf_text_key}, streaming={args.hf_streaming}")
 
     # 計画
     allowed_modes = {"causal", "bidir"}
@@ -300,6 +399,9 @@ def main():
         if is_main: print(f"[warn] --grad_sim_pair={args.grad_sim_pair} を causal,bidir に修正します")
         pair = ["causal", "bidir"]
 
+    # 直近の損失をキャッシュ（alternateでも常に両方表示）
+    last_losses = {"causal": float("nan"), "bidir": float("nan")}
+
     while opt_step < args.max_steps:
         for batch in dl:
             if opt_step >= args.max_steps: break
@@ -315,10 +417,6 @@ def main():
             else:
                 idx = (micro_step if args.alt_unit == "micro" else opt_step) % len(cycle)
                 plan = [(cycle[idx], 1.0)]
-
-            # bidir を要求しているのに flex が無い計画になっていないか再確認
-            if any(m == "bidir" for m, _ in plan) and not flex_available:
-                raise RuntimeError("bidir は flex_attention 必須です。--attn_impl flex_attention にしてください。")
 
             use_cuda_ev = args.profile_timing and torch.cuda.is_available()
             if use_cuda_ev:
@@ -344,11 +442,15 @@ def main():
                             mask_ratio=args.bidir_ratio, exclude_special=args.bidir_exclude_special,
                         )
                         bidir_active_this_step += act_cnt
-                        out = model(xb, labels=yb, mask_function=full_visible_mask)  # 双方向（FlexAttention前提）
+                        out = model(xb, labels=yb, mask_function=full_visible_mask)  # FlexAttention前提
                         loss_items["bidir"] = float(out.loss.detach().item())
                         loss_total += weight * out.loss; weight_sum += weight
                     else:
                         raise ValueError(f"unknown mode: {mode}")
+
+                # キャッシュ更新
+                for k, v in loss_items.items():
+                    last_losses[k] = v
 
                 loss = loss_total / max(1e-9, weight_sum)
                 if use_cuda_ev: e_f1.record()
@@ -384,13 +486,13 @@ def main():
             ema_tflops  = (1 - ema_alpha) * ema_tflops  + ema_alpha * tflops
             ema_loss    = loss.item() if ema_loss is None else (0.9 * ema_loss + 0.1 * loss.item())
 
-            # lr / grad_norm / update-to-weight（global）
+            # lr / grad_norm / update-to-weight
             lr_now = sch.get_last_lr()[0]
             g_norm = global_grad_norm(model)
             wt_norm = global_weight_norm(model)
             utw = (lr_now * g_norm / wt_norm) if wt_norm else float("nan")
 
-            # 勾配コサイン類似度（指定間隔）
+            # 勾配コサイン類似度（オプション）
             grad_sim = float("nan")
             if (args.grad_sim_every > 0) and accelerator.sync_gradients and (opt_step % args.grad_sim_every == 0):
                 def fwd_loss(mode_name: str):
@@ -424,13 +526,13 @@ def main():
             else:
                 fwd_ms = bwd_ms = optim_ms = 0.0
 
-            # ログ
+            # ログ（alternateでも直近の両損失を表示）
             if is_main and (micro_step % args.report_every == 0):
                 log = dict(
                     micro=micro_step, step=opt_step, plan=[m for m, _ in plan],
                     loss=float(loss.item()), loss_ema=round(ema_loss, 4),
-                    loss_causal=round(loss_items.get("causal", float("nan")), 4),
-                    loss_bidir=round(loss_items.get("bidir", float("nan")), 4),
+                    loss_causal=round(last_losses["causal"], 4),
+                    loss_bidir=round(last_losses["bidir"], 4),
                     lr=lr_now, grad_norm=round(g_norm, 3),
                     update_to_weight=round(utw, 6),
                     grad_sim=round(grad_sim, 4),
@@ -444,7 +546,7 @@ def main():
                     log["mfu_%"] = round(100.0 * ema_tflops / args.gpu_peak_tflops, 1)
                 print(log, flush=True)
 
-            # 定期保存（最終マイクロでのみ）
+            # 定期保存
             if (args.save_every > 0) and accelerator.sync_gradients and (opt_step % args.save_every == 0) and (opt_step > 0):
                 save_hf_checkpoint(accelerator, model, tok, args.output_dir, f"step{opt_step:06d}")
 
