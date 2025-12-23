@@ -196,7 +196,7 @@ def save_hf_checkpoint(accelerator: Accelerator, model, tokenizer, outdir: str, 
 def make_bidir_views(
     input_ids: torch.Tensor,
     *,
-    tokenizer: AutoTokenizer,
+    mask_id,
     mask_ratio: float = 0.2,
     exclude_special: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
@@ -207,8 +207,8 @@ def make_bidir_views(
     """
     B, S = input_ids.shape
     labels = torch.full_like(input_ids, -100)
-    mask_id = tokenizer.mask_token_id
-    assert mask_id is not None, "tokenizer に '<mask>' が必要です。"
+    #mask_id = tokenizer.mask_token_id
+    #assert mask_id is not None, "tokenizer に '<mask>' が必要です。"
 
     eligible = torch.ones_like(input_ids, dtype=torch.bool)
     eligible[:, 0] = False  # i-1 が無い先頭は除外
@@ -292,12 +292,8 @@ def main():
 
     # tokenizer（[MASK] を保証）
     tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    added_mask = False
-    if tok.mask_token is None:
-        tok.add_special_tokens({"mask_token": "<mask>"})
-        added_mask = True
+    # pad は今回使わないので設定不要（将来padするなら別途<|pad|>を足す）
+    mask_id = tok.unk_token_id  # 既存トークンを“見かけのマスク”として流用
 
     # model & attention backend
     dtype = torch.bfloat16 if args.bf16 and torch.cuda.is_available() else torch.float32
@@ -324,8 +320,8 @@ def main():
     base_model = Qwen3ForCausalLM.from_pretrained(
         args.model_id, torch_dtype=dtype, attn_implementation=attn_impl, use_cache=False
     )
-    if added_mask:
-        base_model.resize_token_embeddings(len(tok))
+    #if added_mask:
+    #    base_model.resize_token_embeddings(len(tok))
     n_params_total = sum(p.numel() for p in base_model.parameters())
 
     # optim/sched
@@ -437,8 +433,12 @@ def main():
                         loss_items["causal"] = float(out.loss.detach().item())
                         loss_total += weight * out.loss; weight_sum += weight
                     elif mode == "bidir":
+                        #xb, yb, act_cnt = make_bidir_views(
+                        #    batch["input_ids"], tokenizer=tok,
+                        #    mask_ratio=args.bidir_ratio, exclude_special=args.bidir_exclude_special,
+                        #)
                         xb, yb, act_cnt = make_bidir_views(
-                            batch["input_ids"], tokenizer=tok,
+                            batch["input_ids"], mask_id=mask_id,
                             mask_ratio=args.bidir_ratio, exclude_special=args.bidir_exclude_special,
                         )
                         bidir_active_this_step += act_cnt
