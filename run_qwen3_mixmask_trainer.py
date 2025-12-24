@@ -192,7 +192,8 @@ class MixMaskTrainer(Trainer):
 
         return x, labels
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        num_items_in_batch = kwargs.get("num_items_in_batch", None)
         # DataCollatorForLanguageModeling(mlm=False) で labels=input_ids が入ってくる想定
         tokenizer = self.tokenizer
         mode = self._mode_now()
