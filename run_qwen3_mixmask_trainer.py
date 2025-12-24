@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Qwen3 (0.6B〜8B) 継続学習: run_clm.py ベース拡張
-- CLM（causal）と bidir（FlexAttention + マスク関数）を切替
-- FineWeb-Edu streaming を固定長でパック
-- 語彙は増やさない（mask_token は既存のものを使用；無ければ UNK）
+Qwen3 0.6B〜8B: CLM+MLM 同時学習トレーナ
+- 同一バッチの input_ids から、CLM 用（そのまま）と MLM 用（ランダム [MASK] 置換）を生成
+- CLM と MLM を同一ステップで forward し、損失を重み付き合算（--both_weights）
+- MLM 時は FlexAttention で「全可視（双方向）」にするため mask_function を使用
+- 語彙は増やさない（既存の mask_token_id が無い場合は unk_token_id を使用）
 
 依存:
   pip install -U torch accelerate transformers datasets
 
-実行例:
-  # CLMのみ（SDPAでOK）
-  python run_qwen3_mixmask_trainer.py \
+例:
+  # CLM + MLM を同時学習（推奨）
+  python run_qwen3_clm_mlm_trainer.py \
     --model_name_or_path Qwen/Qwen3-0.6B \
     --dataset_name HuggingFaceFW/fineweb-edu --dataset_split train --text_column text --streaming \
     --seqlen 2048 --per_device_train_batch_size 2 --gradient_accumulation_steps 8 \
     --learning_rate 2e-5 --warmup_steps 100 --max_steps 1000 \
-    --attn_impl sdpa --mask_policy causal \
+    --attn_impl flex_attention \
+    --mask_policy both --both_weights 1.0,1.0 \
+    --mlm_mask_ratio 0.15 \
     --bf16 True --report_to none --logging_steps 20
 
-  # CLMとbidirを交互（FlexAttention必須）
-  python run_qwen3_mixmask_trainer.py \
-    --model_name_or_path Qwen/Qwen3-0.6B \
-    --dataset_name HuggingFaceFW/fineweb-edu --dataset_split train --text_column text --streaming \
-    --seqlen 2048 --per_device_train_batch_size 2 --gradient_accumulation_steps 8 \
-    --learning_rate 2e-5 --warmup_steps 100 --max_steps 1000 \
-    --attn_impl flex_attention --mask_policy alternate --bidir_ratio 0.2 \
-    --bf16 True --report_to none --logging_steps 20
+  # CLM のみ（SDPAでOK）
+  python run_qwen3_clm_mlm_trainer.py \
+    --attn_impl sdpa --mask_policy clm ...
+
+  # MLM のみ（FlexAttention必須）
+  python run_qwen3_clm_mlm_trainer.py \
+    --attn_impl flex_attention --mask_policy mlm --mlm_mask_ratio 0.15 ...
 """
-
 import os, math, time, argparse
 from typing import Optional, Iterator, List, Dict, Tuple
 
 import torch
 from torch.utils.data import IterableDataset, DataLoader
-
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
@@ -44,8 +44,12 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 
-# ====================== FineWeb streaming fixed-length packer ======================
-class FineWebPackedIterable(IterableDataset):
+# ------------------------ Dataset: streaming fixed-length packing ------------------------
+class PackedStreamingIterable(IterableDataset):
+    """
+    streaming で読み込み → tokenize(add_special_tokens=False) → 文末に EOS を1つだけ付与して連結 →
+    seqlen で固定長に切り出し（padしない）
+    """
     def __init__(
         self,
         *,
@@ -113,140 +117,233 @@ class FineWebPackedIterable(IterableDataset):
                     chunk[0] = self.tok.bos_token_id
                 yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
 
-# ====================== Attention mask functions (FlexAttention用) ======================
-def bidir_mask_function(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
-    """
-    情報リーク防止：クエリ位置 q は「直右のトークン（q+1）」を見ない。
-    これにより「(q+1) を予測対象」にしても、q がそのトークン自体を参照せずに
-    左右文脈（q+1 以外）から復元するよう学習できる。
-    """
-    return (kv_idx != q_idx + 1)
+# ------------------------ FlexAttention mask functions ------------------------
+def full_visible_mask(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
+    """MLM 用：全トークン可視（双方向）。"""
+    return True
 
-# ====================== Helper: non-random selection for bidir ======================
-def deterministic_select_mask_positions(seq_len: int, ratio: float) -> torch.BoolTensor:
+# ------------------------ MLM helpers ------------------------
+def choose_mlm_positions_random(
+    input_ids: torch.LongTensor,
+    mask_ratio: float,
+    special_ids: Optional[torch.Tensor] = None,
+    rng: Optional[torch.Generator] = None,
+) -> torch.BoolTensor:
     """
-    完全ランダムではなく「等間隔サンプリング」に近い選択（ユーザ希望に配慮）
-    先頭(0)は除外、選択範囲は [1, seq_len-1] （= (q+1) 側の学習対象）
+    Bernoulli(mask_ratio) でランダムにマスク位置を選ぶ。
+    - 特殊トークン（EOS/BOS/PAD 等）は除外。
+    - 全Falseになるのを避けるため、最低1個は有効化する。
     """
-    sel = torch.zeros(seq_len, dtype=torch.bool)
-    if seq_len <= 1 or ratio <= 0.0:
+    B, S = input_ids.shape
+    device = input_ids.device
+    sel = torch.zeros((B, S), dtype=torch.bool, device=device)
+    if mask_ratio <= 0.0:
         return sel
-    num_targets = seq_len - 1
-    k = max(1, int(round(ratio * num_targets)))
-    stride = max(1, num_targets // k)
-    idx = torch.arange(1, seq_len, dtype=torch.long)[::stride][:k]
-    sel[idx] = True
+    # 候補（特殊トークン除外）
+    cand = torch.ones((B, S), dtype=torch.bool, device=device)
+    if special_ids is not None and special_ids.numel() > 0:
+        for sid in special_ids.tolist():
+            cand &= (input_ids != sid)
+
+    # Bernoulli
+    rnd = torch.rand((B, S), generator=rng, device=device)
+    sel = (rnd < mask_ratio) & cand
+
+    # 各行最低1個
+    any_row = sel.any(dim=1)
+    if (~any_row).any():
+        for b in torch.where(~any_row)[0].tolist():
+            # 先頭/末尾より中域を優先（適当に 1..S-2 から探す）
+            start, end = (1, max(1, S - 1))
+            fallback = torch.arange(start, end, device=device)
+            if special_ids is not None and special_ids.numel() > 0:
+                mask_ok = torch.ones_like(fallback, dtype=torch.bool, device=device)
+                for sid in special_ids.tolist():
+                    mask_ok &= (input_ids[b, start:end] != sid)
+                fallback = fallback[mask_ok]
+            if fallback.numel() == 0:
+                fallback = torch.arange(0, S, device=device)
+            idx = fallback[torch.randint(0, fallback.numel(), (1,), device=device)]
+            sel[b, idx] = True
     return sel
 
-# ====================== Trainer subclass: CLM / bidir 切替 ======================
-class MixMaskTrainer(Trainer):
-    def __init__(self, *args, mask_policy: str = "causal", bidir_ratio: float = 0.2, attn_impl: str = "sdpa", **kwargs):
-        """
-        mask_policy: "causal" | "bidir" | "alternate"
-        attn_impl  : "flex_attention" | "sdpa" | "flash_attention_2" | "eager"
-        """
+# ------------------------ Trainer subclass ------------------------
+class MixTaskTrainer(Trainer):
+    """
+    mask_policy:
+      - "clm"       : CLM のみ
+      - "mlm"       : MLM のみ（FlexAttention 必須）
+      - "alternate" : ステップごとに clm / mlm を交互
+      - "both"      : 同一ステップで clm と mlm を両方 forward し、重み付き合算
+    """
+    def __init__(
+        self,
+        *args,
+        mask_policy: str = "both",
+        mlm_mask_ratio: float = 0.15,
+        both_weights: str = "1.0,1.0",   # "w_clm,w_mlm"
+        attn_impl: str = "flex_attention",
+        **kwargs
+    ):
         super().__init__(*args, **kwargs)
-        self.mask_policy = mask_policy
-        self.bidir_ratio = bidir_ratio
-        self.attn_impl = attn_impl
-        # FlexAttention が必要
-        self.is_flex = (attn_impl == "flex_attention")
-        if self.mask_policy in ("bidir", "alternate") and not self.is_flex:
-            raise RuntimeError("bidir/alternate を使うには --attn_impl flex_attention が必要です。")
+        # 後方互換（causal/bidir を受け付ける）
+        alias = {"causal": "clm", "bidir": "mlm"}
+        mask_policy = alias.get(mask_policy, mask_policy)
 
-        # ログ用のトークンカウンタ
+        self.mask_policy = mask_policy
+        self.mlm_mask_ratio = float(mlm_mask_ratio)
+        self.attn_impl = attn_impl
+        self.is_flex = (attn_impl == "flex_attention")
+
+        if self.mask_policy in ("mlm", "alternate", "both") and not self.is_flex:
+            raise RuntimeError("MLM を含む学習（mlm/alternate/both）には --attn_impl flex_attention が必要です。")
+
+        w = [float(x.strip()) for x in both_weights.split(",")]
+        if len(w) != 2:
+            raise ValueError("--both_weights は 'w_clm,w_mlm' の2要素で指定してください（例: 1.0,1.0）")
+        self.w_clm, self.w_mlm = w
+
+        # RNG（再現性）。Trainer の seed/locale を活用
+        dev = self.model.device if hasattr(self, "model") else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self._rng = torch.Generator(device=dev)
+        try:
+            base_seed = int(getattr(self.args, "seed", 42))
+        except Exception:
+            base_seed = 42
+        local_rank = int(getattr(self.args, "local_rank", 0) or 0)
+        self._rng.manual_seed(base_seed + local_rank)
+
+        # ログ用
         self._tok_total = 0
         self._tok_last = 0
         self._t_last = time.time()
         self._n_params = sum(p.numel() for p in self.model.parameters())
 
     def _mode_now(self) -> str:
-        if self.mask_policy in ("causal", "bidir"):
+        if self.mask_policy in ("clm", "mlm", "both"):
             return self.mask_policy
-        # alternate: ステップごとに交互
-        return "bidir" if (self.state.global_step % 2 == 1) else "causal"
+        # alternate
+        return "mlm" if (self.state.global_step % 2 == 1) else "clm"
 
-    def _build_bidir_batch(self, inputs: Dict[str, torch.Tensor], tokenizer: AutoTokenizer) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _get_processor(trainer) -> AutoTokenizer:
+        proc = getattr(trainer, "processing_class", None)
+        if proc is None:
+            proc = getattr(trainer, "tokenizer", None)  # 互換用
+        return proc
+
+    def _build_mlm_batch(self, inputs: Dict[str, torch.Tensor], processor: AutoTokenizer) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """
-        入力の (q+1) 側を一部 mask_id で置換し、その位置だけ labels を残す。それ以外は -100。
-        モデル側の ForCausalLMLoss は内部シフトするので、labels は「未シフト」でOK。
+        同じ input_ids から MLM 用 (input, labels) を作る。
+        - 入力の選択位置を mask_token_id（無ければ unk）に置換
+        - labels は選択位置のみ元トークン、それ以外は -100
+        - 返り値: (masked_input_ids, labels, 有効ラベル数)
         """
         input_ids = inputs["input_ids"]
         B, S = input_ids.shape
-        labels = input_ids.clone()
-        labels[:] = -100  # デフォルトは無視
+        labels = torch.full_like(input_ids, -100)
 
-        # 置換に使うトークン（mask_token_id があればそれを、なければ unk）
-        mask_id = getattr(tokenizer, "mask_token_id", None)
+        mask_id = getattr(processor, "mask_token_id", None)
         if mask_id is None:
-            mask_id = tokenizer.unk_token_id
+            mask_id = processor.unk_token_id
         assert mask_id is not None, "tokenizer に unk_token が必要です。"
 
-        x = input_ids.clone()
-        active = 0
-        for b in range(B):
-            sel = deterministic_select_mask_positions(S, self.bidir_ratio)  # True の列が (q+1) 側
-            x[b][sel] = mask_id
-            labels[b][sel] = input_ids[b][sel]
-            active += int(sel.sum().item())
+        # 特殊トークン（BOS/EOS/PAD）を除外
+        special_ids = []
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            val = getattr(processor, name, None)
+            if val is not None:
+                special_ids.append(val)
+        special_ids = torch.tensor(special_ids, device=input_ids.device, dtype=torch.long) if len(special_ids) else None
 
-        return x, labels
+        sel = choose_mlm_positions_random(input_ids, self.mlm_mask_ratio, special_ids, self._rng)
+
+        x = input_ids.clone()
+        x[sel] = mask_id
+        labels[sel] = input_ids[sel]
+        active = int(sel.sum().item())
+        return x, labels, active
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        num_items_in_batch = kwargs.get("num_items_in_batch", None)
-        # DataCollatorForLanguageModeling(mlm=False) で labels=input_ids が入ってくる想定
-        tokenizer = self.tokenizer
+        # Trainer>=4.44 互換
+        _ = kwargs.get("num_items_in_batch", None)
+        processor = self._get_processor(self)
         mode = self._mode_now()
 
-        if mode == "bidir":
-            # FlexAttention のときだけ mask_function を渡す
-            x, y = self._build_bidir_batch(inputs, tokenizer)
-            outputs = model(input_ids=x,
-                            attention_mask=inputs.get("attention_mask", None),
-                            labels=y,
-                            mask_function=bidir_mask_function)
-            loss = outputs.loss
-        else:
-            # causal: SDPA/Flash/Eager もOK。mask_function は渡さない
-            outputs = model(input_ids=inputs["input_ids"],
-                            attention_mask=inputs.get("attention_mask", None),
-                            labels=inputs["labels"])
-            loss = outputs.loss
+        # CLM: そのまま（labels は DataCollatorForLanguageModeling(mlm=False) で未シフトの複製）
+        if mode == "clm":
+            out = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask", None),
+                labels=inputs["labels"],  # 未シフト
+            )
+            loss = out.loss
+            act = (inputs["labels"] != -100).sum().item()
+            self.log({"loss_clm": round(float(loss.detach().cpu()), 4)})
 
-        # ログ（tokens/sec, TFLOPsの概算）
+        # MLM: FlexAttention + 全可視（full_visible_mask）
+        elif mode == "mlm":
+            x_mlm, y_mlm, act = self._build_mlm_batch(inputs, processor)
+            out = model(
+                input_ids=x_mlm,
+                attention_mask=inputs.get("attention_mask", None),
+                labels=y_mlm,
+                mask_function=full_visible_mask,  # 全可視
+            )
+            loss = out.loss
+            self.log({"loss_mlm": round(float(loss.detach().cpu()), 4)})
+
+        # BOTH: 同一ステップで CLM+MLM を forward → 重み付き合算
+        else:  # "both"
+            # CLM
+            out_c = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask", None),
+                labels=inputs["labels"],
+            )
+            loss_c = out_c.loss
+            act_c = (inputs["labels"] != -100).sum().item()
+
+            # MLM（FlexAttention）
+            x_mlm, y_mlm, act_m = self._build_mlm_batch(inputs, processor)
+            out_m = model(
+                input_ids=x_mlm,
+                attention_mask=inputs.get("attention_mask", None),
+                labels=y_mlm,
+                mask_function=full_visible_mask,
+            )
+            loss_m = out_m.loss
+            act = int(act_c + act_m)
+
+            # 重み付き合算
+            loss = self.w_clm * loss_c + self.w_mlm * loss_m
+
+            self.log({
+                "loss_clm": round(float(loss_c.detach().cpu()), 4),
+                "loss_mlm": round(float(loss_m.detach().cpu()), 4),
+            })
+
+        # 共通: 速度/TFLOPs 概算
         with torch.no_grad():
-            # 今バッチの有効トークン数
-            if mode == "bidir":
-                active = (y != -100).sum().item()
-            else:
-                # CLM: 内部シフトで実質 S-1 トークンが対象（paddingがあれば collator 側で -100）
-                active = (inputs["labels"] != -100).sum().item()
-            self._tok_total += active
             t_now = time.time()
             dt = max(1e-6, t_now - self._t_last)
+            self._tok_total += int(act)
             dTok = self._tok_total - self._tok_last
             tps = dTok / dt
             tflops = (6.0 * self._n_params * tps) / 1e12
-            # 次回用
             self._t_last = t_now
             self._tok_last = self._tok_total
+            self.log({"tps_active": round(float(tps), 1),
+                      "tflops": round(float(tflops), 2)})
 
-            # 代表的なログ値
-            if mode == "bidir":
-                self.log({"loss_bidir": float(loss.detach().cpu()),
-                          "tps_active": float(tps), "tflops": float(tflops)})
-            else:
-                self.log({"loss_causal": float(loss.detach().cpu()),
-                          "tps_active": float(tps), "tflops": float(tflops)})
+        return (loss, out) if return_outputs else loss
 
-        return (loss, outputs) if return_outputs else loss
-
-# ====================== main ======================
+# ------------------------ CLI ------------------------
 def parse_args():
     p = argparse.ArgumentParser()
     # モデル/注意実装
     p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-0.6B")
-    p.add_argument("--attn_impl", type=str, default="sdpa",
+    p.add_argument("--attn_impl", type=str, default="flex_attention",
                    choices=["flex_attention", "sdpa", "flash_attention_2", "eager"])
 
     # データ
@@ -260,12 +357,13 @@ def parse_args():
     p.add_argument("--cache_dir", type=str, default=None)
     p.add_argument("--add_bos_at_chunk_start", action="store_true", default=False)
 
-    # 目的切替
-    p.add_argument("--mask_policy", type=str, default="causal",
-                   choices=["causal", "bidir", "alternate"])
-    p.add_argument("--bidir_ratio", type=float, default=0.2)
+    # 学習方針
+    p.add_argument("--mask_policy", type=str, default="both",
+                   choices=["clm", "mlm", "alternate", "both", "causal", "bidir"])  # 後方互換名を含む
+    p.add_argument("--mlm_mask_ratio", type=float, default=0.15)
+    p.add_argument("--both_weights", type=str, default="1.0,1.0")  # "w_clm,w_mlm"
 
-    # TrainingArguments 相当（主要どころ）
+    # TrainingArguments（主要）
     p.add_argument("--output_dir", type=str, default="ckpt_out")
     p.add_argument("--per_device_train_batch_size", type=int, default=2)
     p.add_argument("--per_device_eval_batch_size", type=int, default=2)
@@ -285,25 +383,19 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Tokenizer（語彙は増やさない。mask_token は既存/UNK）
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True, trust_remote_code=True)
-    # pad を使わない（固定長パック）ので pad_token 設定は不要
-    # 参考: 既存 mask_token が無ければ後で UNK を代用する
 
-    # Model
     model = Qwen3ForCausalLM.from_pretrained(
         args.model_name_or_path,
         attn_implementation=args.attn_impl,
         use_cache=False,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if args.bf16 and torch.cuda.is_available() else torch.float32,
+        torch_dtype=(torch.bfloat16 if args.bf16 and torch.cuda.is_available() else torch.float32),
     )
 
-    # Data: streaming fixed-length packing
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
-
-    train_ds = FineWebPackedIterable(
+    train_ds = PackedStreamingIterable(
         tokenizer=tok,
         dataset_name=args.dataset_name,
         dataset_config=args.dataset_config,
@@ -320,13 +412,11 @@ def main():
         cache_dir=args.cache_dir,
     )
 
-    # DataLoader + collator（CLM: 未シフト labels）
+    # CLM ラベル生成は collator に任せる（未シフト、-100 マスク）
     collator = DataCollatorForLanguageModeling(tok, mlm=False)
     train_dl = DataLoader(train_ds, batch_size=args.per_device_train_batch_size,
-                          shuffle=False, drop_last=True, num_workers=0,
-                          collate_fn=collator)
+                          shuffle=False, drop_last=True, num_workers=0, collate_fn=collator)
 
-    # TrainingArguments
     targs = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -344,19 +434,18 @@ def main():
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
     )
 
-    # Trainer（CLM/bidir 切替）
-    trainer = MixMaskTrainer(
+    trainer = MixTaskTrainer(
         model=model,
         args=targs,
-        train_dataset=train_ds,   # IterableDataset を直渡し（Trainer内部でDL構築）
-        tokenizer=tok,
+        train_dataset=train_ds,          # IterableDataset を渡す（内部で DL 構築）
+        processing_class=tok,            # ★ tokenizer 警告の公式解
         data_collator=collator,
         mask_policy=args.mask_policy,
-        bidir_ratio=args.bidir_ratio,
+        mlm_mask_ratio=args.mlm_mask_ratio,
+        both_weights=args.both_weights,
         attn_impl=args.attn_impl,
     )
 
-    # ちょいサニティ表示
     if trainer.is_world_process_zero():
         emb = model.get_input_embeddings().weight
         head = model.lm_head.weight
@@ -365,13 +454,13 @@ def main():
             "emb_vs_head_tied": (emb.data_ptr() == head.data_ptr()),
             "attn_impl": args.attn_impl,
             "mask_policy": args.mask_policy,
-            "bidir_ratio": args.bidir_ratio,
+            "mlm_mask_ratio": args.mlm_mask_ratio,
         })
 
     trainer.train()
 
     if trainer.is_world_process_zero():
-        trainer.save_model(args.output_dir)   # 最終チェックポイント保存
+        trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
 
 if __name__ == "__main__":
