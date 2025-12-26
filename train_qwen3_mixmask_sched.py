@@ -1,41 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Qwen3 (0.6B〜8B) 継続学習: CLM + bidir 切替学習（FineWeb対応・固定長パック）
-
-修正ポイント（重要）:
-- CLM の labels は「非シフト」のまま model に渡す（HF 側で自動シフト）。← 二重シフト防止
-- bidir(MNTP等価): 「(t+1) をマスクした位置のみ labels の列 (t+1) に x_{t+1} を置く」
-  => HF の shift 規約 (labels[...,1:]) と完全整合
-- 語彙は増やさない（<mask> 追加/resize 禁止）。bidir の置換は UNK を代用。
+Qwen3 (0.6B〜8B) 継続学習: CLM + bidir（MNTP等価, 100/0/0）
++ FineWeb (HF datasets) 対応: ストリーミング読込→分散シャード→固定長トークンパック
 
 依存:
-  pip install -U torch accelerate transformers datasets
+  pip install torch>=2.6 accelerate>=0.33 transformers>=4.57 datasets>=3
 """
 
 import os, time, math, argparse, random
 from typing import List, Dict, Tuple, Iterator, Optional
-
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, IterableDataset
-
 from accelerate import Accelerator
 from accelerate.utils import DistributedType
 from accelerate.logging import get_logger
-
 from transformers import AutoTokenizer, Qwen3ForCausalLM, get_cosine_schedule_with_warmup
 
-# ===================== Attention mask callbacks =====================
+# =============== Attention masks ===============
 def causal_mask(b, h, q_idx, kv_idx):
-    # 標準の因果マスク（下三角）
-    return q_idx >= kv_idx
+    return q_idx >= kv_idx  # 因果
 
 def full_visible_mask(b, h, q_idx, kv_idx):
-    # 双方向（全可視）
-    return torch.ones_like(q_idx >= 0, dtype=torch.bool)
+    return torch.ones_like(q_idx >= 0, dtype=torch.bool)  # 双方向
 
-# ===================== Toy dataset (簡易動作確認用) =====================
+# =============== Toy dataset (従来) ===============
 class ToyIDs(Dataset):
     def __init__(self, vocab_size=32000, n=10000, seqlen=2048, seed=7):
         g = torch.Generator().manual_seed(seed)
@@ -43,13 +33,17 @@ class ToyIDs(Dataset):
     def __len__(self): return len(self.data)
     def __getitem__(self, i): return {"input_ids": self.data[i]}
 
-# ===================== FineWeb: streaming packer =====================
+# =============== FineWeb Packed IterableDataset ===============
+"""
+方針:
+- HF datasets から streaming=True でテキスト列を読む
+- 各ドキュメントを tokenize(add_special_tokens=False) → 末尾に EOS を1個挿入（文書境界の手がかり）
+- 連結バッファに貯め、seqlen ごとにスライスして 1 サンプルとして吐く（固定長パック）
+- 分散: ds.shard(num_shards=world_size, index=rank) でノード間を分割
+- 乱択: datasets 側の .shuffle(buffer_size, seed) を利用（ストリーミング）
+"""
+
 class FineWebPackedIterable(IterableDataset):
-    """
-    HF datasets を streaming 読み→rank shard→buffer shuffle→tokenize(add_special_tokens=False)
-    → ドキュメント末尾に EOS を1つ付与 → 連結 → seqlen 固定長でパック
-    add_bos_at_chunk_start=True なら、各チャンク先頭トークンを BOS に差し替え（長さ不変）
-    """
     def __init__(
         self,
         *,
@@ -66,13 +60,12 @@ class FineWebPackedIterable(IterableDataset):
         seed: int = 42,
         cache_dir: Optional[str] = None,
         add_eos_between_docs: bool = True,
-        add_bos_at_chunk_start: bool = False,
     ):
         super().__init__()
         self.hf_name = hf_name
         self.hf_config = hf_config
         self.hf_split = hf_split
-        self.tok = tokenizer
+        self.tokenizer = tokenizer
         self.seqlen = seqlen
         self.world_size = max(1, world_size)
         self.rank = max(0, rank)
@@ -82,7 +75,7 @@ class FineWebPackedIterable(IterableDataset):
         self.seed = seed
         self.cache_dir = cache_dir
         self.add_eos_between_docs = add_eos_between_docs
-        self.add_bos_at_chunk_start = add_bos_at_chunk_start
+
         assert tokenizer.eos_token_id is not None, "tokenizer に eos_token が必要です。"
 
     def _hf_iter(self):
@@ -94,47 +87,51 @@ class FineWebPackedIterable(IterableDataset):
             streaming=self.streaming,
             cache_dir=self.cache_dir,
         )
+        # 分散シャーディング（各 rank に異なるストリームを割当て）
         if hasattr(ds, "shard"):
             ds = ds.shard(num_shards=self.world_size, index=self.rank)
+        # ストリーミングシャッフル（大きめのバッファ推奨）
         if hasattr(ds, "shuffle") and self.shuffle_buffer > 0:
             ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
         return ds
 
     def _tokenize_text(self, txt: str) -> List[int]:
-        ids = self.tok(txt, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+        # add_special_tokens=False: あとで doc 間に eos を明示的に挿入
+        ids = self.tokenizer(txt, add_special_tokens=False, return_attention_mask=False)["input_ids"]
         if not isinstance(ids, list): ids = list(ids)
         return ids
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        eos = self.tok.eos_token_id
+        rng = random.Random(self.seed + self.rank)
+        eos = self.tokenizer.eos_token_id
         buf: List[int] = []
+
+        # 反復ストリーム
         for ex in self._hf_iter():
-            txt = ex.get(self.text_key, "")
+            txt = ex[self.text_key]
             if not isinstance(txt, str) or len(txt) == 0:
                 continue
             ids = self._tokenize_text(txt)
             if self.add_eos_between_docs:
                 ids = ids + [eos]
+            # 連結
             buf.extend(ids)
+
+            # 固定長で吐く
             while len(buf) >= self.seqlen:
                 chunk = buf[:self.seqlen]
                 buf = buf[self.seqlen:]
-                if self.add_bos_at_chunk_start:
-                    bos = self.tok.bos_token_id
-                    if bos is not None:
-                        chunk[0] = bos
                 yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
 
-# ===================== collate: ★非シフト★ =====================
-def clm_collate(batch):
-    """
-    HF CausalLM は内部で shift するので、ここでは labels=ids をそのまま渡す
-    """
+# =============== collator（CLM用の右シフト） ===============
+def clm_collate(batch, pad_id=0):
     ids = torch.stack([ex["input_ids"] for ex in batch], dim=0)
-    labels = ids.clone()  # -100 は不要（内部で labels[...,1:] を参照）
+    labels = ids.clone()
+    labels[:, :-1] = ids[:, 1:]
+    labels[:, -1] = -100
     return {"input_ids": ids, "labels": labels}
 
-# ===================== distributed-safe utils =====================
+# =============== distributed-safe utils ===============
 def allreduce_sum_scalar(x: float, device=None) -> float:
     t = torch.tensor([x], device=device or ("cuda" if torch.cuda.is_available() else "cpu"), dtype=torch.float32)
     if dist.is_initialized():
@@ -160,7 +157,30 @@ def global_weight_norm(model) -> float:
         sq += p.detach().float().pow(2).sum().item()
     return math.sqrt(max(allreduce_sum_scalar(sq), 1e-30))
 
-# ===================== save (Accelerate/FSDP safe) =====================
+@torch.no_grad()
+def _dot_norms_from_two_grad_lists(grads_a, grads_b, device):
+    dot = torch.tensor(0.0, device=device); na = torch.tensor(0.0, device=device); nb = torch.tensor(0.0, device=device)
+    for ga, gb in zip(grads_a, grads_b):
+        if ga is None or gb is None: continue
+        ga = ga.float(); gb = gb.float()
+        dot += (ga * gb).sum(); na += (ga * ga).sum(); nb += (gb * gb).sum()
+    if dist.is_initialized():
+        dist.all_reduce(dot); dist.all_reduce(na); dist.all_reduce(nb)
+    return float(dot.item()), float(na.item()), float(nb.item())
+
+def grad_cosine_similarity_from_losses(model, loss_a, loss_b) -> float:
+    params = [p for p in model.parameters() if p.requires_grad]
+    ga = torch.autograd.grad(loss_a, params, retain_graph=False, create_graph=False, allow_unused=True)
+    gb = torch.autograd.grad(loss_b, params, retain_graph=False, create_graph=False, allow_unused=True)
+    device = loss_a.device
+    dot, na, nb = _dot_norms_from_two_grad_lists(ga, gb, device=device)
+    if na <= 0.0 or nb <= 0.0: return float("nan")
+    return dot / (math.sqrt(na) * math.sqrt(nb) + 1e-12)
+
+def parse_list(s: str) -> List[str]:
+    return [t.strip() for t in s.split(",") if t.strip()]
+
+# =============== save (Accelerate/FSDP safe) ===============
 def save_hf_checkpoint(accelerator: Accelerator, model, tokenizer, outdir: str, tag: str):
     accelerator.wait_for_everyone()
     state_dict = accelerator.get_state_dict(model)
@@ -172,43 +192,54 @@ def save_hf_checkpoint(accelerator: Accelerator, model, tokenizer, outdir: str, 
         tokenizer.save_pretrained(save_dir)
     accelerator.wait_for_everyone()
 
-# ===================== bidir views (MNTP等価, 100/0/0) =====================
+# =============== bidir views (MNTP等価, 100/0/0) ===============
 def make_bidir_views(
     input_ids: torch.Tensor,
     *,
-    mask_id: int,
+    mask_id,
     mask_ratio: float = 0.2,
     exclude_special: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
-    HFシフト規約に整合:
-    - to_mask: (t+1) をマスクするブール
-    - labels は「(t+1) が選ばれた位置の列 (t+1) に x_{t+1} を置く」（それ以外は -100）
-    - 入力 x は to_mask の位置を mask_id に置換
+    bidir（MNTP等価, 100/0/0）: 選ばれた i は必ず [MASK]。
+    labels[:, t] は (t+1) が選ばれている場合のみ x_{t+1}、それ以外は -100。
+    戻り値: (masked_input_ids, labels, active_count)
     """
     B, S = input_ids.shape
     labels = torch.full_like(input_ids, -100)
-    to_mask = (torch.rand_like(input_ids.float()) < mask_ratio)
+    #mask_id = tokenizer.mask_token_id
+    #assert mask_id is not None, "tokenizer に '<mask>' が必要です。"
 
+    eligible = torch.ones_like(input_ids, dtype=torch.bool)
+    eligible[:, 0] = False  # i-1 が無い先頭は除外
+    if exclude_special:
+        for tid in [tokenizer.pad_token_id, tokenizer.eos_token_id,
+                    tokenizer.bos_token_id, tokenizer.unk_token_id, mask_id]:
+            if tid is not None:
+                eligible &= (input_ids != tid)
+
+    to_mask = (torch.rand_like(input_ids.float()) < mask_ratio) & eligible
     active_count = 0
     if S > 1:
-        sel = to_mask[:, 1:]                # 列 1..S-1（= t+1）
-        labels[:, 1:][sel] = input_ids[:, 1:][sel]
-        active_count = int(sel.sum().item())
+        m_right = to_mask[:, 1:]
+        tgt = input_ids[:, 1:]
+        labels[:, :-1][m_right] = tgt[m_right]
+        active_count = int(m_right.sum().item())
 
     x = input_ids.clone()
-    x[to_mask] = mask_id
+    if to_mask.any():
+        idx = to_mask.nonzero(as_tuple=False)
+        x[idx[:, 0], idx[:, 1]] = mask_id
+
     return x, labels, active_count
 
-# ===================== main =====================
-def parse_list(s: str) -> List[str]:
-    return [t.strip() for t in s.split(",") if t.strip()]
-
+# =============== main ===============
 def main():
     ap = argparse.ArgumentParser()
     # 基本
     ap.add_argument("--model_id", default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--attn_impl", default="sdpa", choices=["flex_attention", "sdpa", "flash_attention_2", "eager"])
+    ap.add_argument("--attn_impl", default="flex_attention",
+                    choices=["flex_attention", "sdpa", "flash_attention_2", "eager"])
     ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--batch_size", type=int, default=2)
     ap.add_argument("--grad_accum", type=int, default=8)
@@ -225,19 +256,21 @@ def main():
     ap.add_argument("--alternate_order", default="causal,bidir")
     ap.add_argument("--alt_unit", choices=["micro", "step"], default="micro")
 
-    # bidir 指定
+    # bidir
     ap.add_argument("--bidir_ratio", type=float, default=0.2)
+    ap.add_argument("--bidir_exclude_special", action="store_true", default=True)
 
-    # データ
+    # データ選択
     ap.add_argument("--data_source", choices=["toy", "fineweb"], default="fineweb")
-    ap.add_argument("--hf_name", type=str, default="HuggingFaceFW/fineweb-edu")
-    ap.add_argument("--hf_config", type=str, default=None)
+    # FineWeb 仕様
+    ap.add_argument("--hf_name", type=str, default="HuggingFaceFW/fineweb-edu",
+                    help="HF datasets 名。例: HuggingFaceFW/fineweb, HuggingFaceFW/fineweb-edu など")
+    ap.add_argument("--hf_config", type=str, default=None, help="必要ならコンフィグ名（例: 'sample', 'cc-net-v1' 等）")
     ap.add_argument("--hf_split", type=str, default="train")
     ap.add_argument("--hf_text_key", type=str, default="text")
     ap.add_argument("--hf_streaming", action="store_true", default=True)
     ap.add_argument("--hf_shuffle_buffer", type=int, default=10000)
     ap.add_argument("--hf_cache_dir", type=str, default=None)
-    ap.add_argument("--add_bos_at_chunk_start", action="store_true", default=False)
 
     # 保存/計測
     ap.add_argument("--output_dir", type=str, default="ckpt_out")
@@ -245,29 +278,25 @@ def main():
     ap.add_argument("--report_every", type=int, default=20)
     ap.add_argument("--gpu_peak_tflops", type=float, default=None)
     ap.add_argument("--profile_timing", action="store_true")
+    ap.add_argument("--grad_sim_every", type=int, default=0)
+    ap.add_argument("--grad_sim_pair", default="causal,bidir")
 
     args = ap.parse_args()
 
-    # Accelerator（CPUならAMPオフ）
-    mp = "bf16" if (args.bf16 and torch.cuda.is_available()) else "no"
-    accelerator = Accelerator(
-        log_with=None,
-        gradient_accumulation_steps=args.grad_accum,
-        mixed_precision=mp,
-    )
+    # Accelerator（grad_accumを適用）
+    accelerator = Accelerator(log_with=None, gradient_accumulation_steps=args.grad_accum)
     logger = get_logger(__name__, log_level="INFO")
     is_main = accelerator.is_main_process
     world_size = accelerator.num_processes
     rank = accelerator.process_index
 
-    # Tokenizer（語彙は増やさない。<mask> は追加しない）
-    tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True, trust_remote_code=True)
-    # bidir の置換トークンは既存の UNK を代用
-    mask_id = tok.unk_token_id
-    assert mask_id is not None, "tokenizer に unk_token が必要です。"
+    # tokenizer（[MASK] を保証）
+    tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
+    # pad は今回使わないので設定不要（将来padするなら別途<|pad|>を足す）
+    mask_id = tok.unk_token_id  # 既存トークンを“見かけのマスク”として流用
 
-    # Model
-    dtype = torch.bfloat16 if (args.bf16 and torch.cuda.is_available()) else torch.float32
+    # model & attention backend
+    dtype = torch.bfloat16 if args.bf16 and torch.cuda.is_available() else torch.float32
     attn_impl = args.attn_impl
     flex_available = False
     if attn_impl == "flex_attention":
@@ -276,32 +305,40 @@ def main():
             flex_available = True
         except Exception:
             flex_available = False
-            attn_impl = "sdpa"
-            if is_main:
-                print("[warn] flex_attention が見つからないため sdpa にフォールバックします。")
+
+    wants_bidir = ("bidir" in parse_list(args.both_masks)) or ("bidir" in parse_list(args.alternate_order))
+    if wants_bidir and not flex_available:
+        raise RuntimeError(
+            "bidir（双方向注意）は FlexAttention があると安全に切替できます。"
+            "今は見つからないため、--attn_impl flex_attention を有効にするか、bidir をオフにしてください。"
+        )
+    if attn_impl == "flex_attention" and not flex_available:
+        attn_impl = "sdpa"
+        if is_main:
+            print("[warn] flex_attention が見つからないため sdpa にフォールバックします。")
 
     base_model = Qwen3ForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=dtype,
-        attn_implementation=attn_impl,
-        use_cache=False,
-        trust_remote_code=True,
+        args.model_id, torch_dtype=dtype, attn_implementation=attn_impl, use_cache=False
     )
+    #if added_mask:
+    #    base_model.resize_token_embeddings(len(tok))
     n_params_total = sum(p.numel() for p in base_model.parameters())
 
-    # Optim/Sched
+    # optim/sched
     opt = torch.optim.AdamW(base_model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     sch = get_cosine_schedule_with_warmup(opt, args.warmup_steps, args.max_steps)
 
-    # Dataset & DataLoader
+    # dataset
     if args.data_source == "toy":
         ds = ToyIDs(seqlen=args.seqlen)
+        num_workers = 4
+        collate = clm_collate
         dl = DataLoader(
             ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
-            collate_fn=clm_collate, num_workers=4, persistent_workers=True,
-            pin_memory=torch.cuda.is_available()
+            collate_fn=lambda b: collate(b, pad_id=tok.pad_token_id or 0),
+            pin_memory=torch.cuda.is_available(), num_workers=num_workers, persistent_workers=True
         )
-    else:
+    else:  # fineweb
         ds = FineWebPackedIterable(
             hf_name=args.hf_name,
             hf_config=args.hf_config,
@@ -316,44 +353,20 @@ def main():
             seed=1337,
             cache_dir=args.hf_cache_dir,
             add_eos_between_docs=True,
-            add_bos_at_chunk_start=args.add_bos_at_chunk_start,
         )
+        # IterableDataset は worker による並列は非推奨（HF streaming と相性NG）
         dl = DataLoader(
             ds, batch_size=args.batch_size, shuffle=False, drop_last=True,
-            collate_fn=clm_collate, num_workers=0,
-            pin_memory=torch.cuda.is_available()
+            collate_fn=lambda b: clm_collate(b, pad_id=tok.pad_token_id or 0),
+            pin_memory=torch.cuda.is_available(), num_workers=0
         )
 
-    # Prepare (DDP/FSDP)
+    # prepare (DDP/FSDP)
     model, opt, dl, sch = accelerator.prepare(base_model, opt, dl, sch)
-    unwrapped = accelerator.unwrap_model(model)
-
     if is_main:
-        print(f"#params: {n_params_total/1e6:.1f} M, attn_impl={attn_impl}, flex_ok={flex_available}, unk_mask_id={mask_id}")
+        print(f"#params: {n_params_total/1e6:.1f} M, attn_impl={attn_impl}, flex_ok={flex_available}, mask_token_id={tok.mask_token_id}")
         if args.data_source == "fineweb":
             print(f"FineWeb: name={args.hf_name}, config={args.hf_config}, split={args.hf_split}, text_key={args.hf_text_key}, streaming={args.hf_streaming}")
-
-    # --- 軽い sanity: tying/語彙/ln|V| と最初の eval_probe ---
-    if is_main:
-        emb = unwrapped.get_input_embeddings().weight
-        head_w = unwrapped.lm_head.weight
-        print({
-            "vocab_size": len(tok),
-            "emb_vs_head_tied": emb.data_ptr() == head_w.data_ptr(),
-            "ln_vocab": round(math.log(len(tok)), 4),
-        })
-        # eval probe（学習なし）
-        try:
-            model.eval(); tot=0.0; cnt=0
-            with torch.no_grad():
-                for i, bb in zip(range(4), dl):
-                    bb = {k: v.to(accelerator.device) for k, v in bb.items()}
-                    out = model(bb["input_ids"], labels=bb["labels"], mask_function=causal_mask)
-                    tot += float(out.loss.item()); cnt += 1
-            model.train()
-            print({"eval_probe_loss": round(tot/max(1,cnt), 4)})
-        except Exception as e:
-            print({"eval_probe_error": repr(e)})
 
     # 計画
     allowed_modes = {"causal", "bidir"}
@@ -367,13 +380,6 @@ def main():
     else:
         cycle = parse_list(args.alternate_order); assert all(m in allowed_modes for m in cycle) and len(cycle) >= 1
 
-    wants_bidir = (
-        (args.mask_policy == "both" and any(m == "bidir" for m, _ in (mask_plan_static if 'mask_plan_static' in locals() else [])))
-        or (args.mask_policy == "alternate" and any(m == "bidir" for m in cycle))
-    )
-    if wants_bidir and not flex_available:
-        raise RuntimeError("bidir を使うには --attn_impl flex_attention が必要です。CLMのみなら --alternate_order causal --both_masks causal を指定。")
-
     opt.zero_grad(set_to_none=True)
 
     ema_alpha = 0.1
@@ -383,6 +389,14 @@ def main():
 
     micro_step = 0; opt_step = 0; t0 = time.perf_counter()
     model.train()
+
+    pair = parse_list(args.grad_sim_pair)
+    if len(pair) != 2 or not all(m in allowed_modes for m in pair):
+        if is_main: print(f"[warn] --grad_sim_pair={args.grad_sim_pair} を causal,bidir に修正します")
+        pair = ["causal", "bidir"]
+
+    # 直近の損失をキャッシュ（alternateでも常に両方表示）
+    last_losses = {"causal": float("nan"), "bidir": float("nan")}
 
     while opt_step < args.max_steps:
         for batch in dl:
@@ -413,24 +427,30 @@ def main():
 
             with accelerator.accumulate(model):
                 loss_total = 0.0; weight_sum = 0.0
-
                 for mode, weight in plan:
                     if mode == "causal":
                         out = model(batch["input_ids"], labels=batch["labels"], mask_function=causal_mask)
                         loss_items["causal"] = float(out.loss.detach().item())
                         loss_total += weight * out.loss; weight_sum += weight
-
                     elif mode == "bidir":
+                        #xb, yb, act_cnt = make_bidir_views(
+                        #    batch["input_ids"], tokenizer=tok,
+                        #    mask_ratio=args.bidir_ratio, exclude_special=args.bidir_exclude_special,
+                        #)
                         xb, yb, act_cnt = make_bidir_views(
-                            batch["input_ids"], mask_id=mask_id, mask_ratio=args.bidir_ratio
+                            batch["input_ids"], mask_id=mask_id,
+                            mask_ratio=args.bidir_ratio, exclude_special=args.bidir_exclude_special,
                         )
                         bidir_active_this_step += act_cnt
-                        out = model(xb, labels=yb, mask_function=full_visible_mask)
+                        out = model(xb, labels=yb, mask_function=full_visible_mask)  # FlexAttention前提
                         loss_items["bidir"] = float(out.loss.detach().item())
                         loss_total += weight * out.loss; weight_sum += weight
-
                     else:
                         raise ValueError(f"unknown mode: {mode}")
+
+                # キャッシュ更新
+                for k, v in loss_items.items():
+                    last_losses[k] = v
 
                 loss = loss_total / max(1e-9, weight_sum)
                 if use_cuda_ev: e_f1.record()
@@ -451,7 +471,7 @@ def main():
             clm_active_local = int((batch["labels"] != -100).sum().item()) if any(m=="causal" for m,_ in plan) else 0
             effective_active_local = clm_active_local + bidir_active_this_step
 
-            # 経過時間（全rank max）
+            # 経過時間（全rankの max）
             t1 = time.perf_counter()
             dt_local = max(1e-9, t1 - t0); t0 = t1
 
@@ -472,6 +492,24 @@ def main():
             wt_norm = global_weight_norm(model)
             utw = (lr_now * g_norm / wt_norm) if wt_norm else float("nan")
 
+            # 勾配コサイン類似度（オプション）
+            grad_sim = float("nan")
+            if (args.grad_sim_every > 0) and accelerator.sync_gradients and (opt_step % args.grad_sim_every == 0):
+                def fwd_loss(mode_name: str):
+                    if mode_name == "causal":
+                        return model(batch["input_ids"], labels=batch["labels"], mask_function=causal_mask).loss
+                    elif mode_name == "bidir":
+                        xi, xl, _ = make_bidir_views(
+                            batch["input_ids"], tokenizer=tok,
+                            mask_ratio=args.bidir_ratio, exclude_special=args.bidir_exclude_special,
+                        )
+                        return model(xi, labels=xl, mask_function=full_visible_mask).loss
+                    else:
+                        raise ValueError(mode_name)
+                a, b = parse_list(args.grad_sim_pair)
+                loss_a = fwd_loss(a); loss_b = fwd_loss(b)
+                grad_sim = grad_cosine_similarity_from_losses(model, loss_a, loss_b)
+
             # メモリ
             if torch.cuda.is_available():
                 peak_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -488,21 +526,24 @@ def main():
             else:
                 fwd_ms = bwd_ms = optim_ms = 0.0
 
-            # ログ
+            # ログ（alternateでも直近の両損失を表示）
             if is_main and (micro_step % args.report_every == 0):
                 log = dict(
                     micro=micro_step, step=opt_step, plan=[m for m, _ in plan],
                     loss=float(loss.item()), loss_ema=round(ema_loss, 4),
-                    loss_causal=round(loss_items.get("causal", float("nan")), 4),
-                    loss_bidir=round(loss_items.get("bidir", float("nan")), 4),
+                    loss_causal=round(last_losses["causal"], 4),
+                    loss_bidir=round(last_losses["bidir"], 4),
                     lr=lr_now, grad_norm=round(g_norm, 3),
                     update_to_weight=round(utw, 6),
+                    grad_sim=round(grad_sim, 4),
                     tps_active=round(tps_active, 1), tps_active_ema=round(ema_tps_act, 1),
                     tflops=round(tflops, 2), tflops_ema=round(ema_tflops, 2),
                     host_gap_ms=round(host_gap_ms, 2),
                     fwd_ms=round(fwd_ms, 2), bwd_ms=round(bwd_ms, 2), optim_ms=round(optim_ms, 2),
                     peak_alloc_gb=round(peak_alloc_gb, 2), peak_reserved_gb=round(peak_res_gb, 2),
                 )
+                if args.gpu_peak_tflops:
+                    log["mfu_%"] = round(100.0 * ema_tflops / args.gpu_peak_tflops, 1)
                 print(log, flush=True)
 
             # 定期保存
