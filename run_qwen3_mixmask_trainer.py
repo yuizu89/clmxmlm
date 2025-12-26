@@ -425,16 +425,19 @@ class CLMMLMTrainer(Trainer):
         out["grad_sim_ms"] = (time.time() - t0) * 1000.0
         return out
 
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items_in_batch=None):
         # start macro-step timer at first micro
         if self._step_start_time is None:
             self._step_start_time = time.time()
 
-        loss = super().training_step(model, inputs)
+        # Transformersのバージョン差を吸収
+        try:
+            loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        except TypeError:
+            loss = super().training_step(model, inputs)
 
         # macro-step end is when gradients are synchronized (last micro in accumulation)
         if getattr(self, "accelerator", None) is not None and self.accelerator.sync_gradients:
-            # If this macro-step will be logged (next global_step), compute grad stats & optionally grad_sim.
             next_step = int(self.state.global_step) + 1
             is_log_step = (self.args.logging_steps > 0) and (next_step % int(self.args.logging_steps) == 0)
 
@@ -458,6 +461,7 @@ class CLMMLMTrainer(Trainer):
             self._step_start_time = None
 
         return loss
+
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None):
         # keep eval logs as-is
