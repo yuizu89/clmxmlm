@@ -5,18 +5,23 @@ import os
 import time
 import math
 import argparse
+import inspect
+import json
+import csv
 from typing import Optional, Iterator, List, Dict, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
+)
 
-try:
-    import torch.distributed as dist
-except Exception:
-    dist = None
+from transformers.trainer_callback import TrainerCallback
 
 
 # -------------------------- FlexAttention mask functions --------------------------
@@ -27,20 +32,12 @@ def full_visible_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int)
     return True
 
 
-# -------------------------- DDP helpers --------------------------
-def dist_is_init() -> bool:
-    return dist is not None and dist.is_available() and dist.is_initialized()
-
-def allreduce_sum_scalar(x: float, device: torch.device) -> float:
-    if not dist_is_init():
-        return float(x)
-    t = torch.tensor(float(x), device=device, dtype=torch.float64)
-    dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    return float(t.item())
-
-
 # -------------------------- Tokenizer / mask token setup --------------------------
 def ensure_mask_token(tokenizer, model, mask_token: str = "<mask>") -> int:
+    """
+    Qwen系 tokenizer に <mask> を追加して mask_token_id を確保する。
+    - 追加で語彙が増えるが、CLMデータに <mask> が出現しない限り CLM loss への影響は実質ゼロ。
+    """
     mask_id = getattr(tokenizer, "mask_token_id", None)
     if mask_id is None:
         num_added = tokenizer.add_special_tokens({"mask_token": mask_token})
@@ -128,7 +125,7 @@ class PackedStreamingIterable(IterableDataset):
 def clm_collate(examples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     input_ids = torch.stack([ex["input_ids"] for ex in examples], dim=0)  # (B,S)
     attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-    labels = input_ids.clone()  # CLM: built-in loss shifts internally
+    labels = input_ids.clone()  # 非shiftで渡す（CausalLM側が内部でshift）
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
@@ -172,25 +169,112 @@ def choose_mlm_positions_random(
     return sel
 
 
-# -------------------------- Norm helpers --------------------------
-def global_grad_norm(model) -> float:
-    device = next(model.parameters()).device
+# -------------------------- Norm helpers (per-GPU; no allreduce) --------------------------
+def local_grad_norm(model) -> float:
+    m = getattr(model, "module", model)
     sq = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            v = p.grad.detach().float()
-            sq += (v * v).sum().item()
-    sq = allreduce_sum_scalar(sq, device)
+    for p in m.parameters():
+        if p.grad is None:
+            continue
+        v = p.grad.detach().float()
+        sq += float((v * v).sum().item())
     return math.sqrt(max(sq, 1e-30))
 
-def global_weight_norm(model) -> float:
-    device = next(model.parameters()).device
+def local_weight_norm(model) -> float:
+    m = getattr(model, "module", model)
     sq = 0.0
-    for p in model.parameters():
+    for p in m.parameters():
         v = p.detach().float()
-        sq += (v * v).sum().item()
-    sq = allreduce_sum_scalar(sq, device)
+        sq += float((v * v).sum().item())
     return math.sqrt(max(sq, 1e-30))
+
+
+# -------------------------- Log saving callback (JSONL + CSV) --------------------------
+def _as_py(x):
+    # json / csv 向けの安全な変換
+    try:
+        if isinstance(x, (float, int, str, bool)) or x is None:
+            return x
+        if hasattr(x, "item") and callable(x.item):
+            return x.item()
+        return float(x)
+    except Exception:
+        return str(x)
+
+class SaveLogsCallback(TrainerCallback):
+    """
+    - on_log で `logs` を output_dir に JSONL / CSV として保存
+    - rank0 のみ書く
+    """
+    def __init__(self, output_dir: str, jsonl_name="train_log.jsonl", csv_name="train_log.csv"):
+        self.output_dir = output_dir
+        self.jsonl_path = os.path.join(output_dir, jsonl_name)
+        self.csv_path = os.path.join(output_dir, csv_name)
+        self._csv_file = None
+        self._jsonl_file = None
+        self._csv_writer = None
+
+        # 固定列（あなたのログ形式に合わせておく：増えても JSONL が真）
+        self.fieldnames = [
+            "step", "epoch", "lr",
+            "loss", "loss_clm", "loss_mlm",
+            "tps_active", "tflops",
+            "grad_norm", "update_to_weight",
+            "grad_sim", "grad_norm_clm", "grad_norm_mlm",
+            "grad_sim_ms", "grad_sim_oom",
+        ]
+
+    def _is_zero(self, state) -> bool:
+        return bool(getattr(state, "is_world_process_zero", True))
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not self._is_zero(state):
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # JSONL（追記）
+        self._jsonl_file = open(self.jsonl_path, "a", encoding="utf-8")
+
+        # CSV（無ければヘッダを書く / あれば追記）
+        new_csv = not os.path.exists(self.csv_path) or os.path.getsize(self.csv_path) == 0
+        self._csv_file = open(self.csv_path, "a", newline="", encoding="utf-8")
+        self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=self.fieldnames, extrasaction="ignore")
+        if new_csv:
+            self._csv_writer.writeheader()
+            self._csv_file.flush()
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None or not self._is_zero(state):
+            return
+        if self._jsonl_file is None or self._csv_writer is None:
+            return
+
+        # Trainer が渡す logs には eval_* も混ざるので、ここでは全部残す（必要ならフィルタ可）
+        rec = {k: _as_py(v) for k, v in logs.items()}
+
+        # JSONL: フルで保存（後処理が楽）
+        self._jsonl_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._jsonl_file.flush()
+
+        # CSV: 固定列のみ（可視化・Excel向け）
+        row = {k: rec.get(k, "") for k in self.fieldnames}
+        self._csv_writer.writerow(row)
+        self._csv_file.flush()
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self._jsonl_file is not None:
+            try:
+                self._jsonl_file.close()
+            except Exception:
+                pass
+            self._jsonl_file = None
+        if self._csv_file is not None:
+            try:
+                self._csv_file.close()
+            except Exception:
+                pass
+            self._csv_file = None
+        self._csv_writer = None
 
 
 # -------------------------- Trainer --------------------------
@@ -230,25 +314,25 @@ class CLMMLMTrainer(Trainer):
         self.grad_sim_enabled = bool(grad_sim)
         self._can_grad_sim = (self.mask_policy == "both")
 
-        # RNG
+        # RNG（device上）
         dev = self.model.device
         self._rng = torch.Generator(device=dev)
         base_seed = int(getattr(self.args, "seed", 42))
         local_rank = int(getattr(self.args, "local_rank", 0) or 0)
         self._rng.manual_seed(base_seed + local_rank)
 
-        self._n_params = sum(p.numel() for p in self.model.parameters())
-        self._world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
+        self._n_params = int(sum(p.numel() for p in self.model.parameters()))
         self._reset_interval()
+
         self._step_start_time: Optional[float] = None
+        self._micro_in_step: int = 0
 
         self._pending_grad_stats: Optional[Dict[str, float]] = None
         self._pending_grad_sim: Optional[Dict[str, float]] = None
 
     def _reset_interval(self):
         self._int_micro = 0
-        self._int_loss_total = 0.0
+        self._int_loss = 0.0
         self._int_loss_clm = 0.0
         self._int_loss_mlm = 0.0
         self._int_loss_clm_n = 0
@@ -337,9 +421,9 @@ class CLMMLMTrainer(Trainer):
             active = int(act_c + act_m)
             loss_total = self.w_clm * loss_clm + self.w_mlm * loss_mlm
 
-        # accumulate (NO logging here)
         self._int_micro += 1
-        self._int_loss_total += float(loss_total.detach().float().cpu())
+        self._int_loss += float(loss_total.detach().float().cpu())
+
         if loss_clm is not None:
             self._int_loss_clm += float(loss_clm.detach().float().cpu())
             self._int_loss_clm_n += 1
@@ -353,15 +437,10 @@ class CLMMLMTrainer(Trainer):
         return (loss_total, None) if return_outputs else loss_total
 
     def _compute_grad_sim_all_params(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """
-        Heavy: ALL params cosine similarity between grad(loss_clm) and grad(loss_mlm).
-        If OOM -> returns nan and grad_sim_oom=1.0.
-        """
-        device = self.model.device
         t0 = time.time()
         out: Dict[str, float] = {"grad_sim": float("nan"), "grad_sim_oom": 0.0}
 
-        params = [p for p in self.model.parameters() if p.requires_grad]  # default ALL params
+        params = [p for p in self.model.parameters() if p.requires_grad]
 
         try:
             with self.compute_loss_context_manager():
@@ -385,31 +464,23 @@ class CLMMLMTrainer(Trainer):
             grads_c = torch.autograd.grad(loss_clm, params, allow_unused=True)
             grads_m = torch.autograd.grad(loss_mlm, params, allow_unused=True)
 
-            dot = torch.tensor(0.0, device=device)
-            na = torch.tensor(0.0, device=device)
-            nb = torch.tensor(0.0, device=device)
+            dot = 0.0
+            na = 0.0
+            nb = 0.0
             for gc, gm in zip(grads_c, grads_m):
                 if gc is None or gm is None:
                     continue
-                gc = gc.detach().float()
-                gm = gm.detach().float()
-                dot += (gc * gm).sum()
-                na += (gc * gc).sum()
-                nb += (gm * gm).sum()
+                gc = gc.detach().float().cpu()
+                gm = gm.detach().float().cpu()
+                dot += float((gc * gm).sum().item())
+                na += float((gc * gc).sum().item())
+                nb += float((gm * gm).sum().item())
 
-            if dist_is_init():
-                dist.all_reduce(dot, op=dist.ReduceOp.SUM)
-                dist.all_reduce(na, op=dist.ReduceOp.SUM)
-                dist.all_reduce(nb, op=dist.ReduceOp.SUM)
-
-            dotv = float(dot.item())
-            nav = float(na.item())
-            nbv = float(nb.item())
-            cos = dotv / (math.sqrt(max(nav, 1e-30)) * math.sqrt(max(nbv, 1e-30)) + 1e-30)
+            cos = dot / (math.sqrt(max(na, 1e-30)) * math.sqrt(max(nb, 1e-30)) + 1e-30)
 
             out["grad_sim"] = float(cos)
-            out["grad_norm_clm"] = math.sqrt(max(nav, 1e-30))
-            out["grad_norm_mlm"] = math.sqrt(max(nbv, 1e-30))
+            out["grad_norm_clm"] = math.sqrt(max(na, 1e-30))
+            out["grad_norm_mlm"] = math.sqrt(max(nb, 1e-30))
 
         except RuntimeError as e:
             msg = str(e).lower()
@@ -425,70 +496,87 @@ class CLMMLMTrainer(Trainer):
         out["grad_sim_ms"] = (time.time() - t0) * 1000.0
         return out
 
+    def _is_end_of_step(self) -> bool:
+        if getattr(self, "accelerator", None) is not None:
+            return bool(self.accelerator.sync_gradients)
+        gas = int(getattr(self.args, "gradient_accumulation_steps", 1))
+        return (self._micro_in_step % max(1, gas) == 0)
+
+    def _get_grad_norm(self) -> float:
+        eng = getattr(self, "deepspeed", None)
+        if eng is not None and hasattr(eng, "get_global_grad_norm"):
+            try:
+                g = eng.get_global_grad_norm()
+                if isinstance(g, (float, int)):
+                    return float(g)
+                return float(getattr(g, "item", lambda: g)())
+            except Exception:
+                pass
+        return float(local_grad_norm(self.model))
+
     def training_step(self, model, inputs, num_items_in_batch=None):
-        # start macro-step timer at first micro
+        self._micro_in_step += 1
         if self._step_start_time is None:
             self._step_start_time = time.time()
 
-        # Transformersのバージョン差を吸収
         try:
             loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
         except TypeError:
             loss = super().training_step(model, inputs)
 
-        # macro-step end is when gradients are synchronized (last micro in accumulation)
-        if getattr(self, "accelerator", None) is not None and self.accelerator.sync_gradients:
+        if self._is_end_of_step():
             next_step = int(self.state.global_step) + 1
             is_log_step = (self.args.logging_steps > 0) and (next_step % int(self.args.logging_steps) == 0)
 
             if is_log_step:
-                # grad_norm/update_to_weight must be BEFORE optimizer step/zero_grad
-                gnorm = global_grad_norm(self.model)
-                wnorm = global_weight_norm(self.model)
-                lr = self._compute_lr()
-                upd2w = float(lr) * float(gnorm) / float(max(wnorm, 1e-30))
+                gnorm = self._get_grad_norm()
+                wnorm = float(local_weight_norm(self.model))
+                lr = float(self._compute_lr())
+                upd2w = lr * gnorm / max(wnorm, 1e-30)
                 self._pending_grad_stats = {
-                    "grad_norm": gnorm,
-                    "update_to_weight": upd2w,
+                    "grad_norm": float(gnorm),
+                    "update_to_weight": float(upd2w),
                 }
-
                 if self.grad_sim_enabled and self._can_grad_sim:
                     self._pending_grad_sim = self._compute_grad_sim_all_params(inputs)
 
-            # finalize macro-step time (includes grad_sim cost if run above)
             step_dt = max(1e-9, time.time() - self._step_start_time)
             self._int_step_time += float(step_dt)
             self._step_start_time = None
+            self._micro_in_step = 0
 
         return loss
 
-
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None):
-        # keep eval logs as-is
         if any(k.startswith("eval_") for k in logs.keys()):
-            return super().log(logs, start_time=start_time)
+            try:
+                return super().log(logs, start_time=start_time)
+            except TypeError:
+                return super().log(logs)
 
         dt = max(1e-9, float(self._int_step_time))
         micro = max(1, int(self._int_micro))
 
-        loss_total = self._int_loss_total / micro
+        loss_avg = self._int_loss / micro
         loss_clm = (self._int_loss_clm / max(1, self._int_loss_clm_n)) if self._int_loss_clm_n > 0 else float("nan")
         loss_mlm = (self._int_loss_mlm / max(1, self._int_loss_mlm_n)) if self._int_loss_mlm_n > 0 else float("nan")
 
         tps_active = float(self._int_active_tokens) / dt
-        flops_est = 6.0 * float(self._n_params) * float(self._int_tokens_base) * float(self._world_size)
+
+        # per-GPU TFLOPS estimate (world_size を掛けない)
+        flops_est = 6.0 * float(self._n_params) * float(self._int_tokens_base)
         tflops = (flops_est / dt) / 1e12
 
         step = int(self.state.global_step)
         epoch = float(self.state.epoch) if self.state.epoch is not None else float("nan")
-        lr = self._compute_lr()
+        lr = float(self._compute_lr())
+        lr_disp = float(f"{lr:.8f}") if lr == lr else lr
 
-        out = {
+        out: Dict[str, float] = {
             "step": step,
             "epoch": round(epoch, 4) if epoch == epoch else epoch,
-            "lr": float(lr),
-            "loss": round(float(loss_total), 4),
-            "loss_total": round(float(loss_total), 4),
+            "lr": lr_disp,
+            "loss": round(float(loss_avg), 4),
             "loss_clm": round(float(loss_clm), 4) if loss_clm == loss_clm else loss_clm,
             "loss_mlm": round(float(loss_mlm), 4) if loss_mlm == loss_mlm else loss_mlm,
             "tps_active": round(float(tps_active), 1),
@@ -499,29 +587,33 @@ class CLMMLMTrainer(Trainer):
             out["grad_norm"] = round(float(self._pending_grad_stats["grad_norm"]), 4)
             out["update_to_weight"] = round(float(self._pending_grad_stats["update_to_weight"]), 6)
             self._pending_grad_stats = None
-        else:
-            out["grad_norm"] = float("nan")
-            out["update_to_weight"] = float("nan")
 
         if self._pending_grad_sim is not None:
             gs = self._pending_grad_sim
-            out["grad_sim"] = round(float(gs.get("grad_sim", float("nan"))), 6) if gs.get("grad_sim", float("nan")) == gs.get("grad_sim", float("nan")) else gs.get("grad_sim", float("nan"))
+            if "grad_sim" in gs and gs["grad_sim"] == gs["grad_sim"]:
+                out["grad_sim"] = round(float(gs["grad_sim"]), 6)
+            else:
+                out["grad_sim"] = gs.get("grad_sim", float("nan"))
             if "grad_norm_clm" in gs:
-                out["grad_norm_clm"] = round(float(gs["grad_norm_clm"]), 4) if gs["grad_norm_clm"] == gs["grad_norm_clm"] else gs["grad_norm_clm"]
+                out["grad_norm_clm"] = round(float(gs["grad_norm_clm"]), 4)
             if "grad_norm_mlm" in gs:
-                out["grad_norm_mlm"] = round(float(gs["grad_norm_mlm"]), 4) if gs["grad_norm_mlm"] == gs["grad_norm_mlm"] else gs["grad_norm_mlm"]
+                out["grad_norm_mlm"] = round(float(gs["grad_norm_mlm"]), 4)
             out["grad_sim_ms"] = round(float(gs.get("grad_sim_ms", 0.0)), 2)
             out["grad_sim_oom"] = float(gs.get("grad_sim_oom", 0.0))
             self._pending_grad_sim = None
-        else:
-            # only appears when --grad_sim True and this is a logging step (by design)
-            pass
 
         self._reset_interval()
-        return super().log(out, start_time=start_time)
+
+        try:
+            return super().log(out, start_time=start_time)
+        except TypeError:
+            return super().log(out)
 
 
 # -------------------------- CLI / main --------------------------
+def _str2bool(x: str) -> bool:
+    return str(x).lower() in ("1", "true", "yes", "y", "t")
+
 def parse_args():
     p = argparse.ArgumentParser()
 
@@ -543,10 +635,10 @@ def parse_args():
                    choices=["clm", "mlm", "alternate", "both", "causal", "bidir"])
     p.add_argument("--mlm_mask_ratio", type=float, default=0.15)
     p.add_argument("--both_weights", type=str, default="1.0,1.0")
-    p.add_argument("--ensure_mask_token", type=lambda x: x.lower() == "true", default=True)
+    p.add_argument("--ensure_mask_token", type=_str2bool, default=True)
     p.add_argument("--mask_token_str", type=str, default="<mask>")
 
-    p.add_argument("--grad_sim", type=lambda x: x.lower() == "true", default=False)
+    p.add_argument("--grad_sim", type=_str2bool, default=False)
 
     p.add_argument("--output_dir", type=str, default="ckpt_out")
     p.add_argument("--per_device_train_batch_size", type=int, default=2)
@@ -559,11 +651,18 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=500)
     p.add_argument("--save_total_limit", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--bf16", type=lambda x: x.lower() == "true", default=True)
-    p.add_argument("--fp16", type=lambda x: x.lower() == "true", default=False)
+    p.add_argument("--bf16", type=_str2bool, default=True)
+    p.add_argument("--fp16", type=_str2bool, default=False)
     p.add_argument("--gradient_checkpointing", action="store_true")
-    p.add_argument("--report_to", type=str, default="none")
-    p.add_argument("--ddp_find_unused_parameters", type=lambda x: x.lower() == "true", default=False)
+
+    # ★ ここを tensorboard に（JSONL/CSVは callback で別途保存）
+    p.add_argument("--report_to", type=str, default="tensorboard")
+
+    # ★ TensorBoard event の保存先
+    p.add_argument("--logging_dir", type=str, default=None)
+
+    p.add_argument("--ddp_find_unused_parameters", type=_str2bool, default=False)
+    p.add_argument("--deepspeed", type=str, default=None)
 
     return p.parse_args()
 
@@ -617,7 +716,10 @@ def main():
         cache_dir=args.cache_dir,
     )
 
-    targs = TrainingArguments(
+    # TensorBoard logging_dir（未指定なら output_dir/runs）
+    logging_dir = args.logging_dir or os.path.join(args.output_dir, "runs")
+
+    targs_kwargs = dict(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -632,23 +734,39 @@ def main():
         bf16=args.bf16,
         fp16=args.fp16,
         gradient_checkpointing=args.gradient_checkpointing,
-        report_to=args.report_to,
+        report_to=args.report_to,          # tensorboard
+        logging_dir=logging_dir,           # event file dir
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
     )
+    if args.deepspeed:
+        targs_kwargs["deepspeed"] = args.deepspeed
+
+    targs = TrainingArguments(**targs_kwargs)
+
+    # transformers 版差分対応：processing_class があればそれを使う（tokenizer deprecation回避）
+    trainer_init_sig = inspect.signature(Trainer.__init__)
+    trainer_tokenizer_kw = {}
+    if "processing_class" in trainer_init_sig.parameters:
+        trainer_tokenizer_kw["processing_class"] = tok
+    else:
+        trainer_tokenizer_kw["tokenizer"] = tok
 
     trainer = CLMMLMTrainer(
         model=model,
         args=targs,
         train_dataset=train_ds,
         data_collator=clm_collate,
-        processing_class=tok,
         mask_policy=args.mask_policy,
         mlm_mask_ratio=args.mlm_mask_ratio,
         both_weights=args.both_weights,
         attn_impl=args.attn_impl,
         mask_token_id=mask_id,
         grad_sim=args.grad_sim,
+        **trainer_tokenizer_kw,
     )
+
+    # ★ JSONL/CSV 保存 callback を追加
+    trainer.add_callback(SaveLogsCallback(output_dir=args.output_dir))
 
     if trainer.is_world_process_zero():
         print({
@@ -659,6 +777,11 @@ def main():
             "mask_policy": args.mask_policy,
             "logging_steps": int(args.logging_steps),
             "grad_sim": bool(args.grad_sim),
+            "report_to": args.report_to,
+            "logging_dir": logging_dir,
+            "deepspeed": args.deepspeed,
+            "log_jsonl": os.path.join(args.output_dir, "train_log.jsonl"),
+            "log_csv": os.path.join(args.output_dir, "train_log.csv"),
         })
 
     trainer.train()
