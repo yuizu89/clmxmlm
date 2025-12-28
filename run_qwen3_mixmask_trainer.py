@@ -6,22 +6,13 @@ import time
 import math
 import argparse
 import inspect
-import json
-import csv
 from typing import Optional, Iterator, List, Dict, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    TrainingArguments,
-    Trainer,
-)
-
-from transformers.trainer_callback import TrainerCallback
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
 
 
 # -------------------------- FlexAttention mask functions --------------------------
@@ -96,6 +87,7 @@ class PackedStreamingIterable(IterableDataset):
             streaming=self.streaming,
             cache_dir=self.cache_dir,
         )
+        # HF streaming dataset は shard / shuffle を持つことが多い
         if hasattr(ds, "shard"):
             ds = ds.shard(num_shards=self.world_size, index=self.rank)
         if hasattr(ds, "shuffle") and self.shuffle_buffer > 0:
@@ -125,7 +117,9 @@ class PackedStreamingIterable(IterableDataset):
 def clm_collate(examples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     input_ids = torch.stack([ex["input_ids"] for ex in examples], dim=0)  # (B,S)
     attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-    labels = input_ids.clone()  # 非shiftで渡す（CausalLM側が内部でshift）
+
+    # CLM: transformers の多くの CausalLM は labels を内部で shift して loss を計算するので、非shiftで渡すのが一般的
+    labels = input_ids.clone()
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
@@ -170,111 +164,43 @@ def choose_mlm_positions_random(
 
 
 # -------------------------- Norm helpers (per-GPU; no allreduce) --------------------------
-def local_grad_norm(model) -> float:
-    m = getattr(model, "module", model)
-    sq = 0.0
+def _unwrap_model(model):
+    return getattr(model, "module", model)
+
+def local_grad_sumsq_and_numel(model) -> Tuple[float, int]:
+    """
+    per-GPU: sum(g^2) と要素数 numel を返す（float64で集計）
+    """
+    m = _unwrap_model(model)
+    sumsq = 0.0
+    numel = 0
     for p in m.parameters():
         if p.grad is None:
             continue
-        v = p.grad.detach().float()
-        sq += float((v * v).sum().item())
-    return math.sqrt(max(sq, 1e-30))
+        g = p.grad.detach()
+        # fp16/bf16でも精度のためfloat32へ
+        gf = g.float()
+        sumsq += float((gf * gf).sum().item())
+        numel += int(gf.numel())
+    return sumsq, numel
+
+def local_grad_norm(model) -> float:
+    sumsq, _ = local_grad_sumsq_and_numel(model)
+    return math.sqrt(max(sumsq, 1e-30))
+
+def local_grad_rms(model) -> float:
+    sumsq, n = local_grad_sumsq_and_numel(model)
+    if n <= 0:
+        return float("nan")
+    return math.sqrt(max(sumsq / float(n), 1e-30))
 
 def local_weight_norm(model) -> float:
-    m = getattr(model, "module", model)
+    m = _unwrap_model(model)
     sq = 0.0
     for p in m.parameters():
         v = p.detach().float()
         sq += float((v * v).sum().item())
     return math.sqrt(max(sq, 1e-30))
-
-
-# -------------------------- Log saving callback (JSONL + CSV) --------------------------
-def _as_py(x):
-    # json / csv 向けの安全な変換
-    try:
-        if isinstance(x, (float, int, str, bool)) or x is None:
-            return x
-        if hasattr(x, "item") and callable(x.item):
-            return x.item()
-        return float(x)
-    except Exception:
-        return str(x)
-
-class SaveLogsCallback(TrainerCallback):
-    """
-    - on_log で `logs` を output_dir に JSONL / CSV として保存
-    - rank0 のみ書く
-    """
-    def __init__(self, output_dir: str, jsonl_name="train_log.jsonl", csv_name="train_log.csv"):
-        self.output_dir = output_dir
-        self.jsonl_path = os.path.join(output_dir, jsonl_name)
-        self.csv_path = os.path.join(output_dir, csv_name)
-        self._csv_file = None
-        self._jsonl_file = None
-        self._csv_writer = None
-
-        # 固定列（あなたのログ形式に合わせておく：増えても JSONL が真）
-        self.fieldnames = [
-            "step", "epoch", "lr",
-            "loss", "loss_clm", "loss_mlm",
-            "tps_active", "tflops",
-            "grad_norm", "update_to_weight",
-            "grad_sim", "grad_norm_clm", "grad_norm_mlm",
-            "grad_sim_ms", "grad_sim_oom",
-        ]
-
-    def _is_zero(self, state) -> bool:
-        return bool(getattr(state, "is_world_process_zero", True))
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        if not self._is_zero(state):
-            return
-        os.makedirs(self.output_dir, exist_ok=True)
-
-        # JSONL（追記）
-        self._jsonl_file = open(self.jsonl_path, "a", encoding="utf-8")
-
-        # CSV（無ければヘッダを書く / あれば追記）
-        new_csv = not os.path.exists(self.csv_path) or os.path.getsize(self.csv_path) == 0
-        self._csv_file = open(self.csv_path, "a", newline="", encoding="utf-8")
-        self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=self.fieldnames, extrasaction="ignore")
-        if new_csv:
-            self._csv_writer.writeheader()
-            self._csv_file.flush()
-
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is None or not self._is_zero(state):
-            return
-        if self._jsonl_file is None or self._csv_writer is None:
-            return
-
-        # Trainer が渡す logs には eval_* も混ざるので、ここでは全部残す（必要ならフィルタ可）
-        rec = {k: _as_py(v) for k, v in logs.items()}
-
-        # JSONL: フルで保存（後処理が楽）
-        self._jsonl_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        self._jsonl_file.flush()
-
-        # CSV: 固定列のみ（可視化・Excel向け）
-        row = {k: rec.get(k, "") for k in self.fieldnames}
-        self._csv_writer.writerow(row)
-        self._csv_file.flush()
-
-    def on_train_end(self, args, state, control, **kwargs):
-        if self._jsonl_file is not None:
-            try:
-                self._jsonl_file.close()
-            except Exception:
-                pass
-            self._jsonl_file = None
-        if self._csv_file is not None:
-            try:
-                self._csv_file.close()
-            except Exception:
-                pass
-            self._csv_file = None
-        self._csv_writer = None
 
 
 # -------------------------- Trainer --------------------------
@@ -314,7 +240,7 @@ class CLMMLMTrainer(Trainer):
         self.grad_sim_enabled = bool(grad_sim)
         self._can_grad_sim = (self.mask_policy == "both")
 
-        # RNG（device上）
+        # RNG（device上に置く：MLMマスク生成がGPUで完結）
         dev = self.model.device
         self._rng = torch.Generator(device=dev)
         base_seed = int(getattr(self.args, "seed", 42))
@@ -344,6 +270,7 @@ class CLMMLMTrainer(Trainer):
     def _mode_now(self) -> str:
         if self.mask_policy in ("clm", "mlm", "both"):
             return self.mask_policy
+        # alternate: optimizer step (global_step) 単位で切り替え
         return "mlm" if (self.state.global_step % 2 == 1) else "clm"
 
     def _build_mlm_batch(self, inputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, int]:
@@ -379,6 +306,7 @@ class CLMMLMTrainer(Trainer):
             return float(opt.param_groups[0].get("lr", float("nan")))
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # Transformers 版差分の吸収（Trainerが渡してくるが使わない）
         _ = kwargs.get("num_items_in_batch", None)
 
         mode = self._mode_now()
@@ -421,6 +349,7 @@ class CLMMLMTrainer(Trainer):
             active = int(act_c + act_m)
             loss_total = self.w_clm * loss_clm + self.w_mlm * loss_mlm
 
+        # accumulate (NO logging here)
         self._int_micro += 1
         self._int_loss += float(loss_total.detach().float().cpu())
 
@@ -437,10 +366,17 @@ class CLMMLMTrainer(Trainer):
         return (loss_total, None) if return_outputs else loss_total
 
     def _compute_grad_sim_all_params(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """
+        Heavy: cosine similarity between grad(loss_clm) and grad(loss_mlm).
+        - 計算は autograd.grad で行う（通常学習の backward とは別の “追加” 勾配計算）
+        - ★集計は GPU 上（dot/na/nb/numel）で行い、最後にスカラーだけ取り出す（高速化）
+        - OOM のとき grad_sim_oom=1.0 を返す
+        """
+        device = self.model.device
         t0 = time.time()
         out: Dict[str, float] = {"grad_sim": float("nan"), "grad_sim_oom": 0.0}
 
-        params = [p for p in self.model.parameters() if p.requires_grad]
+        params = [p for p in self.model.parameters() if p.requires_grad]  # default ALL params
 
         try:
             with self.compute_loss_context_manager():
@@ -464,23 +400,36 @@ class CLMMLMTrainer(Trainer):
             grads_c = torch.autograd.grad(loss_clm, params, allow_unused=True)
             grads_m = torch.autograd.grad(loss_mlm, params, allow_unused=True)
 
-            dot = 0.0
-            na = 0.0
-            nb = 0.0
+            dot = torch.zeros((), device=device, dtype=torch.float64)
+            na  = torch.zeros((), device=device, dtype=torch.float64)
+            nb  = torch.zeros((), device=device, dtype=torch.float64)
+            den = torch.zeros((), device=device, dtype=torch.float64)  # numel sum for RMS
+
             for gc, gm in zip(grads_c, grads_m):
                 if gc is None or gm is None:
                     continue
-                gc = gc.detach().float().cpu()
-                gm = gm.detach().float().cpu()
-                dot += float((gc * gm).sum().item())
-                na += float((gc * gc).sum().item())
-                nb += float((gm * gm).sum().item())
+                gc = gc.detach().float()
+                gm = gm.detach().float()
+                dot = dot + (gc * gm).sum(dtype=torch.float64)
+                na  = na  + (gc * gc).sum(dtype=torch.float64)
+                nb  = nb  + (gm * gm).sum(dtype=torch.float64)
+                den = den + float(gc.numel())
 
-            cos = dot / (math.sqrt(max(na, 1e-30)) * math.sqrt(max(nb, 1e-30)) + 1e-30)
+            dotv = float(dot.item())
+            nav  = float(na.item())
+            nbv  = float(nb.item())
+            denv = float(den.item())
+
+            cos = dotv / (math.sqrt(max(nav, 1e-30)) * math.sqrt(max(nbv, 1e-30)) + 1e-30)
 
             out["grad_sim"] = float(cos)
-            out["grad_norm_clm"] = math.sqrt(max(na, 1e-30))
-            out["grad_norm_mlm"] = math.sqrt(max(nb, 1e-30))
+            out["grad_norm_clm"] = math.sqrt(max(nav, 1e-30))
+            out["grad_norm_mlm"] = math.sqrt(max(nbv, 1e-30))
+
+            # RMS（要素数で割る）
+            if denv > 0.0:
+                out["grad_norm_clm_rms"] = math.sqrt(max(nav / denv, 1e-30))
+                out["grad_norm_mlm_rms"] = math.sqrt(max(nbv / denv, 1e-30))
 
         except RuntimeError as e:
             msg = str(e).lower()
@@ -497,49 +446,69 @@ class CLMMLMTrainer(Trainer):
         return out
 
     def _is_end_of_step(self) -> bool:
+        """
+        macro-step（optimizer step）終端判定。
+        - accelerate がある場合は sync_gradients を使う（推奨）
+        - ない場合は gradient_accumulation_steps で自前判定
+        """
         if getattr(self, "accelerator", None) is not None:
             return bool(self.accelerator.sync_gradients)
+
         gas = int(getattr(self.args, "gradient_accumulation_steps", 1))
         return (self._micro_in_step % max(1, gas) == 0)
 
-    def _get_grad_norm(self) -> float:
+    def _get_grad_norm_and_rms(self) -> Tuple[float, float]:
+        """
+        - grad_norm: 可能なら deepspeed engine の global grad norm を優先（ZeRO-2 等）
+        - grad_norm_rms: per-GPU の local RMS（比較しやすい指標として追加）
+        """
+        rms_local = float(local_grad_rms(self.model))
         eng = getattr(self, "deepspeed", None)
         if eng is not None and hasattr(eng, "get_global_grad_norm"):
             try:
                 g = eng.get_global_grad_norm()
                 if isinstance(g, (float, int)):
-                    return float(g)
-                return float(getattr(g, "item", lambda: g)())
+                    return float(g), rms_local
+                return float(getattr(g, "item", lambda: g)()), rms_local
             except Exception:
                 pass
-        return float(local_grad_norm(self.model))
+        return float(local_grad_norm(self.model)), rms_local
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        # micro counter（fallback用）
         self._micro_in_step += 1
+
+        # start macro-step timer at first micro
         if self._step_start_time is None:
             self._step_start_time = time.time()
 
+        # Transformersのバージョン差を吸収
         try:
             loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
         except TypeError:
             loss = super().training_step(model, inputs)
 
+        # macro-step end
         if self._is_end_of_step():
             next_step = int(self.state.global_step) + 1
             is_log_step = (self.args.logging_steps > 0) and (next_step % int(self.args.logging_steps) == 0)
 
             if is_log_step:
-                gnorm = self._get_grad_norm()
+                # grad_norm/update_to_weight must be BEFORE optimizer step/zero_grad
+                gnorm, grms = self._get_grad_norm_and_rms()
                 wnorm = float(local_weight_norm(self.model))
                 lr = float(self._compute_lr())
-                upd2w = lr * gnorm / max(wnorm, 1e-30)
+                upd2w = lr * float(gnorm) / max(wnorm, 1e-30)
                 self._pending_grad_stats = {
                     "grad_norm": float(gnorm),
+                    "grad_norm_rms": float(grms),
                     "update_to_weight": float(upd2w),
                 }
+
                 if self.grad_sim_enabled and self._can_grad_sim:
                     self._pending_grad_sim = self._compute_grad_sim_all_params(inputs)
 
+            # finalize macro-step time (includes grad_sim cost if run above)
             step_dt = max(1e-9, time.time() - self._step_start_time)
             self._int_step_time += float(step_dt)
             self._step_start_time = None
@@ -548,6 +517,14 @@ class CLMMLMTrainer(Trainer):
         return loss
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None):
+        """
+        ここで “まとめログ” を作って super().log に渡す。
+        - tflops は per-GPU（world_size を掛けない）
+        - lr を固定小数で見やすく
+        - grad_norm_rms を追加
+        - grad_sim の clm/mlm RMS を追加
+        """
+        # eval logs はそのまま
         if any(k.startswith("eval_") for k in logs.keys()):
             try:
                 return super().log(logs, start_time=start_time)
@@ -563,14 +540,16 @@ class CLMMLMTrainer(Trainer):
 
         tps_active = float(self._int_active_tokens) / dt
 
-        # per-GPU TFLOPS estimate (world_size を掛けない)
+        # per-GPU TFLOPS estimate
         flops_est = 6.0 * float(self._n_params) * float(self._int_tokens_base)
         tflops = (flops_est / dt) / 1e12
 
         step = int(self.state.global_step)
         epoch = float(self.state.epoch) if self.state.epoch is not None else float("nan")
         lr = float(self._compute_lr())
-        lr_disp = float(f"{lr:.8f}") if lr == lr else lr
+
+        # lr を固定小数（表示目的）
+        lr_disp = float(f"{lr:.8f}") if lr == lr else lr  # nan対応
 
         out: Dict[str, float] = {
             "step": step,
@@ -583,27 +562,38 @@ class CLMMLMTrainer(Trainer):
             "tflops": round(float(tflops), 2),
         }
 
+        # grad stats（ログステップ時のみ）
         if self._pending_grad_stats is not None:
             out["grad_norm"] = round(float(self._pending_grad_stats["grad_norm"]), 4)
+            out["grad_norm_rms"] = round(float(self._pending_grad_stats["grad_norm_rms"]), 6)
             out["update_to_weight"] = round(float(self._pending_grad_stats["update_to_weight"]), 6)
             self._pending_grad_stats = None
 
+        # grad sim（ログステップ時かつ --grad_sim True のときのみ）
         if self._pending_grad_sim is not None:
             gs = self._pending_grad_sim
             if "grad_sim" in gs and gs["grad_sim"] == gs["grad_sim"]:
                 out["grad_sim"] = round(float(gs["grad_sim"]), 6)
             else:
                 out["grad_sim"] = gs.get("grad_sim", float("nan"))
+
             if "grad_norm_clm" in gs:
                 out["grad_norm_clm"] = round(float(gs["grad_norm_clm"]), 4)
             if "grad_norm_mlm" in gs:
                 out["grad_norm_mlm"] = round(float(gs["grad_norm_mlm"]), 4)
+
+            if "grad_norm_clm_rms" in gs:
+                out["grad_norm_clm_rms"] = round(float(gs["grad_norm_clm_rms"]), 6)
+            if "grad_norm_mlm_rms" in gs:
+                out["grad_norm_mlm_rms"] = round(float(gs["grad_norm_mlm_rms"]), 6)
+
             out["grad_sim_ms"] = round(float(gs.get("grad_sim_ms", 0.0)), 2)
             out["grad_sim_oom"] = float(gs.get("grad_sim_oom", 0.0))
             self._pending_grad_sim = None
 
         self._reset_interval()
 
+        # transformers 版差分吸収
         try:
             return super().log(out, start_time=start_time)
         except TypeError:
@@ -625,6 +615,7 @@ def parse_args():
     p.add_argument("--dataset_config", type=str, default=None)
     p.add_argument("--dataset_split", type=str, default="train")
     p.add_argument("--text_column", type=str, default="text")
+    # 既存互換：デフォルトTrueのまま（必要なら後でno_streaming追加）
     p.add_argument("--streaming", action="store_true", default=True)
     p.add_argument("--shuffle_buffer", type=int, default=10_000)
     p.add_argument("--seqlen", type=int, default=2048)
@@ -654,14 +645,10 @@ def parse_args():
     p.add_argument("--bf16", type=_str2bool, default=True)
     p.add_argument("--fp16", type=_str2bool, default=False)
     p.add_argument("--gradient_checkpointing", action="store_true")
-
-    # ★ ここを tensorboard に（JSONL/CSVは callback で別途保存）
-    p.add_argument("--report_to", type=str, default="tensorboard")
-
-    # ★ TensorBoard event の保存先
-    p.add_argument("--logging_dir", type=str, default=None)
-
+    p.add_argument("--report_to", type=str, default="none")
     p.add_argument("--ddp_find_unused_parameters", type=_str2bool, default=False)
+
+    # optional: ZeRO-2等を使うなら ds_config を渡せる
     p.add_argument("--deepspeed", type=str, default=None)
 
     return p.parse_args()
@@ -716,9 +703,6 @@ def main():
         cache_dir=args.cache_dir,
     )
 
-    # TensorBoard logging_dir（未指定なら output_dir/runs）
-    logging_dir = args.logging_dir or os.path.join(args.output_dir, "runs")
-
     targs_kwargs = dict(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -734,8 +718,7 @@ def main():
         bf16=args.bf16,
         fp16=args.fp16,
         gradient_checkpointing=args.gradient_checkpointing,
-        report_to=args.report_to,          # tensorboard
-        logging_dir=logging_dir,           # event file dir
+        report_to=args.report_to,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
     )
     if args.deepspeed:
@@ -743,7 +726,7 @@ def main():
 
     targs = TrainingArguments(**targs_kwargs)
 
-    # transformers 版差分対応：processing_class があればそれを使う（tokenizer deprecation回避）
+    # Transformers 版差分対応：processing_class があればそれを使う（tokenizer deprecation回避）
     trainer_init_sig = inspect.signature(Trainer.__init__)
     trainer_tokenizer_kw = {}
     if "processing_class" in trainer_init_sig.parameters:
@@ -765,9 +748,6 @@ def main():
         **trainer_tokenizer_kw,
     )
 
-    # ★ JSONL/CSV 保存 callback を追加
-    trainer.add_callback(SaveLogsCallback(output_dir=args.output_dir))
-
     if trainer.is_world_process_zero():
         print({
             "vocab_size": len(tok),
@@ -777,11 +757,7 @@ def main():
             "mask_policy": args.mask_policy,
             "logging_steps": int(args.logging_steps),
             "grad_sim": bool(args.grad_sim),
-            "report_to": args.report_to,
-            "logging_dir": logging_dir,
             "deepspeed": args.deepspeed,
-            "log_jsonl": os.path.join(args.output_dir, "train_log.jsonl"),
-            "log_csv": os.path.join(args.output_dir, "train_log.csv"),
         })
 
     trainer.train()
