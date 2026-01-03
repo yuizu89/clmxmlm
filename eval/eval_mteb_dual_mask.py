@@ -97,13 +97,35 @@ def safe_name(x: str) -> str:
     return x or "model"
 
 def _supports_mask_function(model) -> bool:
-    # Best-effort: check forward signature
+    """
+    Best-effort detection for whether model.forward can accept `mask_function=...`.
+
+    Important:
+    - Many HF / trust_remote_code models expose forward as `forward(*args, **kwargs)`.
+      In that case, `mask_function` won't appear in `inspect.signature`, but passing it
+      may still work. So we treat presence of **kwargs as "supported".
+    - This is only a pre-check to avoid false negatives. If the model truly doesn't
+      support mask_function, the actual forward call will raise TypeError later.
+    """
     try:
         sig = inspect.signature(model.forward)
-        return "mask_function" in sig.parameters
+        params = sig.parameters
+
+        # 1) Explicitly listed
+        if "mask_function" in params:
+            return True
+
+        # 2) Accepts **kwargs (VAR_KEYWORD) -> likely accepts mask_function too
+        for p in params.values():
+            if p.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+
+        return False
+
     except Exception:
-        # Fallback: trust_remote_code models may be hard to introspect
+        # If we can't introspect (wrappers, compiled, remote code), don't block bidir here.
         return True
+
 
 def to_iso_lang_script(lang: str) -> str:
     # minimal mapping
