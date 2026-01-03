@@ -1,41 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Evaluate a CLM/MLM-capable decoder-only model as an embedding model on MTEB.
-
-Key features:
-- Two inference masks:
-  (1) bidir/full-visible attention   -> pooling
-  (2) causal attention              -> pooling
-- Combination:
-  - concat: [emb_bidir ; emb_causal]
-  - avg:    (emb_bidir + emb_causal)/2
-- Pooling:
-  - mean (default): mean over non-pad tokens
-  - last: last non-pad token (often reasonable for causal)
-  - cls:  first token (only if you intentionally use BOS/CLS semantics)
-
-This script assumes:
-- transformers model forward can accept `mask_function=` like your training code
-  (works when using FlexAttention integration).
-If your runtime model doesn't accept mask_function, see the note at the bottom.
-"""
-
 import os
 import json
-import math
+import time
 import argparse
-from typing import List, Optional, Literal
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any, Iterable
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from mteb import MTEB
 
-
-# -------------------- FlexAttention mask functions (same as training) --------------------
+# -------------------------- FlexAttention mask functions --------------------------
 def causal_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
     return kv_idx <= q_idx
 
@@ -43,226 +21,255 @@ def full_visible_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int)
     return True
 
 
-# -------------------- pooling --------------------
+# -------------------------- Pooling --------------------------
 def pool_hidden(
-    last_hidden: torch.Tensor,          # (B, S, H)
-    attention_mask: torch.Tensor,       # (B, S) 1=valid, 0=pad
-    method: Literal["mean", "last", "cls"] = "mean",
+    hidden: torch.Tensor,            # (B,S,H)
+    attention_mask: torch.Tensor,    # (B,S) 1 for valid
+    pooling: str,
+    eos_token_id: Optional[int],
+    input_ids: Optional[torch.Tensor] = None,  # (B,S)
 ) -> torch.Tensor:
-    B, S, H = last_hidden.shape
-    am = attention_mask.to(last_hidden.device).to(torch.long)
+    pooling = pooling.lower()
+    B, S, H = hidden.shape
+    am = attention_mask.to(hidden.device)
 
-    if method == "mean":
-        denom = am.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1)
-        x = (last_hidden * am.unsqueeze(-1)).sum(dim=1) / denom
+    if pooling == "mean":
+        denom = am.sum(dim=1, keepdim=True).clamp_min(1)
+        x = (hidden * am.unsqueeze(-1)).sum(dim=1) / denom
         return x
 
-    if method == "last":
-        # last non-pad token
-        idx = (am.sum(dim=1) - 1).clamp(min=0)  # (B,)
-        return last_hidden[torch.arange(B, device=last_hidden.device), idx]
+    if pooling == "last":
+        # last valid token
+        idx = (am.sum(dim=1) - 1).clamp_min(0).long()  # (B,)
+        return hidden[torch.arange(B, device=hidden.device), idx]
 
-    if method == "cls":
-        return last_hidden[:, 0, :]
+    if pooling == "cls":
+        # first token
+        return hidden[:, 0, :]
 
-    raise ValueError(f"unknown pooling: {method}")
+    if pooling == "eos":
+        if eos_token_id is None or input_ids is None:
+            raise ValueError("pooling=eos には eos_token_id と input_ids が必要です。")
+        # last eos in each row, fallback to last valid
+        out = torch.empty((B, H), device=hidden.device, dtype=hidden.dtype)
+        for b in range(B):
+            row = input_ids[b]
+            eos_pos = torch.where(row == eos_token_id)[0]
+            if eos_pos.numel() > 0:
+                j = int(eos_pos[-1].item())
+            else:
+                j = int((am[b].sum() - 1).clamp_min(0).item())
+            out[b] = hidden[b, j]
+        return out
+
+    raise ValueError(f"Unknown pooling: {pooling}")
 
 
-# -------------------- embedding wrapper for MTEB --------------------
-class DualMaskHFEmbedder:
+# -------------------------- HF embedder wrapper for MTEB --------------------------
+@dataclass
+class HFEmbedderConfig:
+    model_name_or_path: str
+    attn_impl: str = "flex_attention"  # must be flex_attention for bidir
+    mask_mode: str = "bidir"           # "bidir" or "causal"
+    pooling: str = "mean"              # mean/last/eos/cls
+    max_length: int = 512
+    dtype: str = "bf16"                # bf16/fp16/fp32
+    device: str = "cuda"               # cuda/cpu
+    batch_size: int = 32
+    normalize: bool = True
+
+
+class HFEmbedder:
     """
-    MTEB calls `encode(sentences, batch_size=..., **kwargs)`.
-
-    We expose:
-      - mask_mode: 'bidir' | 'causal' | 'concat' | 'avg'
-      - pooling_bidir / pooling_causal
+    MTEBが期待する最小インタフェース:
+      - encode(sentences: List[str], **kwargs) -> np.ndarray [N,D]
     """
-    def __init__(
-        self,
-        model_name_or_path: str,
-        device: str = "cuda",
-        dtype: str = "bf16",
-        max_length: int = 512,
-        mask_mode: str = "bidir",
-        pooling_bidir: str = "mean",
-        pooling_causal: str = "mean",
-        normalize: bool = True,
-        attn_impl: str = "flex_attention",
-        trust_remote_code: bool = True,
-    ):
-        self.device = device
-        self.max_length = int(max_length)
-        self.mask_mode = mask_mode
-        self.pooling_bidir = pooling_bidir
-        self.pooling_causal = pooling_causal
-        self.normalize = bool(normalize)
-        self.attn_impl = attn_impl
+    def __init__(self, cfg: HFEmbedderConfig):
+        self.cfg = cfg
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name_or_path, use_fast=True, trust_remote_code=trust_remote_code
+        self.tok = AutoTokenizer.from_pretrained(
+            cfg.model_name_or_path,
+            use_fast=True,
+            trust_remote_code=True,
         )
 
         torch_dtype = {
-            "fp16": torch.float16,
             "bf16": torch.bfloat16,
+            "fp16": torch.float16,
             "fp32": torch.float32,
-        }[dtype]
+        }[cfg.dtype]
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
+            cfg.model_name_or_path,
+            attn_implementation=cfg.attn_impl,
+            trust_remote_code=True,
             torch_dtype=torch_dtype,
-            attn_implementation=attn_impl,
-            trust_remote_code=trust_remote_code,
-        ).to(device)
+        )
 
         self.model.eval()
+        self.device = torch.device(cfg.device if (cfg.device == "cpu" or torch.cuda.is_available()) else "cpu")
+        self.model.to(self.device)
+
+        # for MTEB metadata (なくても大抵動くが、あると親切)
+        self.model_name = cfg.model_name_or_path
+        self.embedding_dim = getattr(self.model.config, "hidden_size", None)
+
+        if cfg.mask_mode not in ("bidir", "causal"):
+            raise ValueError("mask_mode must be 'bidir' or 'causal'")
+
+        if cfg.mask_mode == "bidir" and cfg.attn_impl != "flex_attention":
+            raise ValueError("bidir(full-visible) には --attn_impl flex_attention が必要です。")
+
+    def get_sentence_embedding_dimension(self) -> int:
+        if self.embedding_dim is None:
+            raise RuntimeError("hidden_size を取得できませんでした。")
+        return int(self.embedding_dim)
 
     @torch.no_grad()
-    def _forward_hidden(self, input_ids, attention_mask, mask_function):
-        out = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-            mask_function=mask_function,
-        )
-        # last layer hidden states
-        # transformers CausalLMOutputWithPast: hidden_states is tuple(layer0..last)
-        last_hidden = out.hidden_states[-1]  # (B,S,H)
-        return last_hidden
+    def encode(
+        self,
+        sentences: List[str],
+        **kwargs,
+    ) -> np.ndarray:
+        bs = int(kwargs.get("batch_size", self.cfg.batch_size))
+        max_length = int(kwargs.get("max_length", self.cfg.max_length))
+        normalize = bool(kwargs.get("normalize", self.cfg.normalize))
 
-    @torch.no_grad()
-    def _encode_one_mode(self, sentences: List[str], batch_size: int, mode: str) -> np.ndarray:
-        all_vecs = []
-        for i in range(0, len(sentences), batch_size):
-            batch = sentences[i : i + batch_size]
-            enc = self.tokenizer(
+        outs: List[np.ndarray] = []
+        for i in range(0, len(sentences), bs):
+            batch = sentences[i:i+bs]
+            enc = self.tok(
                 batch,
                 padding=True,
                 truncation=True,
-                max_length=self.max_length,
+                max_length=max_length,
                 return_tensors="pt",
                 add_special_tokens=True,
             )
             input_ids = enc["input_ids"].to(self.device)
             attention_mask = enc["attention_mask"].to(self.device)
 
-            if mode == "bidir":
-                h = self._forward_hidden(input_ids, attention_mask, full_visible_mask_fn)
-                v = pool_hidden(h, attention_mask, self.pooling_bidir)
-            elif mode == "causal":
-                h = self._forward_hidden(input_ids, attention_mask, causal_mask_fn)
-                v = pool_hidden(h, attention_mask, self.pooling_causal)
-            else:
-                raise ValueError(mode)
+            # Qwen系 + flex_attention 前提：mask_function を渡して attention 可視性を切り替え
+            mask_fn = full_visible_mask_fn if self.cfg.mask_mode == "bidir" else causal_mask_fn
 
-            if self.normalize:
-                v = torch.nn.functional.normalize(v, p=2, dim=-1)
+            out = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+                mask_function=mask_fn if self.cfg.attn_impl == "flex_attention" else None,
+            )
 
-            all_vecs.append(v.detach().float().cpu().numpy())
-        return np.concatenate(all_vecs, axis=0)
+            hidden = out.hidden_states[-1]  # (B,S,H)
+            pooled = pool_hidden(
+                hidden=hidden,
+                attention_mask=attention_mask,
+                pooling=self.cfg.pooling,
+                eos_token_id=getattr(self.tok, "eos_token_id", None),
+                input_ids=input_ids,
+            )  # (B,H)
 
-    def encode(
-        self,
-        sentences: List[str],
-        batch_size: int = 32,
-        **kwargs,
-    ):
-        if isinstance(sentences, str):
-            sentences = [sentences]
+            if normalize:
+                pooled = torch.nn.functional.normalize(pooled, p=2, dim=-1)
 
-        mm = self.mask_mode
-        if mm in ("bidir", "causal"):
-            return self._encode_one_mode(sentences, batch_size, mm)
+            outs.append(pooled.detach().float().cpu().numpy())
 
-        if mm == "concat":
-            a = self._encode_one_mode(sentences, batch_size, "bidir")
-            b = self._encode_one_mode(sentences, batch_size, "causal")
-            return np.concatenate([a, b], axis=1)
-
-        if mm == "avg":
-            a = self._encode_one_mode(sentences, batch_size, "bidir")
-            b = self._encode_one_mode(sentences, batch_size, "causal")
-            v = (a + b) * 0.5
-            if self.normalize:
-                denom = np.linalg.norm(v, axis=1, keepdims=True)
-                denom = np.maximum(denom, 1e-12)
-                v = v / denom
-            return v
-
-        raise ValueError(f"unknown mask_mode: {mm}")
+        return np.concatenate(outs, axis=0)
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_name_or_path", type=str, required=True)
+# -------------------------- MTEB runner (new API) --------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name_or_path", type=str, required=True)
 
-    # embedding behavior
-    p.add_argument("--mask_mode", type=str, default="bidir",
-                   choices=["bidir", "causal", "concat", "avg"])
-    p.add_argument("--pooling_bidir", type=str, default="mean", choices=["mean", "last", "cls"])
-    p.add_argument("--pooling_causal", type=str, default="mean", choices=["mean", "last", "cls"])
-    p.add_argument("--normalize", action="store_true", default=True)
-    p.add_argument("--max_length", type=int, default=512)
-    p.add_argument("--batch_size", type=int, default=32)
-
-    # runtime
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
-    p.add_argument("--attn_impl", type=str, default="flex_attention",
-                   choices=["flex_attention", "sdpa", "flash_attention_2", "eager"])
+    parser.add_argument("--attn_impl", type=str, default="flex_attention")
+    parser.add_argument("--mask_mode", type=str, default="bidir", choices=["bidir", "causal"])
+    parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "last", "eos", "cls"])
 
     # MTEB selection
-    p.add_argument("--task_langs", type=str, default="en",
-                   help="comma-separated, e.g. en or en,ja")
-    p.add_argument("--tasks", type=str, default="",
-                   help="comma-separated task names. empty => MTEB(task_langs=...) default suite")
-    p.add_argument("--output_dir", type=str, default="mteb_results")
-    p.add_argument("--no_overwrite", action="store_true", default=False)
-    return p.parse_args()
+    parser.add_argument("--tasks", type=str, default="",
+                        help="カンマ区切りタスク名 (例: Banking77Classification.v2,STSBenchmark)")
+    parser.add_argument("--benchmark", type=str, default="",
+                        help="ベンチマーク名 (例: MTEB(en) など。環境のmtebが提供する名前に依存)")
+    parser.add_argument("--languages", type=str, default="en",
+                        help="ISO 639-3 を推奨（例: en は曖昧になりうるので eng 推奨。カンマ区切り）")
 
+    # encode config
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--normalize", action="store_true", default=True)
+    parser.add_argument("--no_normalize", action="store_true", default=False)
 
-def main():
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
 
-    task_langs = [x.strip() for x in args.task_langs.split(",") if x.strip()]
+    parser.add_argument("--output_folder", type=str, default="mteb_results")
+    parser.add_argument("--overwrite", action="store_true", default=False)
+
+    args = parser.parse_args()
+    if args.no_normalize:
+        args.normalize = False
+
+    # reduce noisy TF logs if tensorflow is installed somewhere
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+    import mteb  # new API: get_tasks / evaluate
+
+    langs = [x.strip() for x in args.languages.split(",") if x.strip()]
+    # NOTE: mteb docs/issue では languages は ISO 639-3 を推奨していることがある
+    # (例: 'eng', 'jpn' など)
+    # ここはユーザ指定をそのまま渡す
+
+    # --- select tasks ---
     if args.tasks.strip():
-        tasks = [x.strip() for x in args.tasks.split(",") if x.strip()]
-        evaluation = MTEB(tasks=tasks, task_langs=task_langs)
+        task_names = [x.strip() for x in args.tasks.split(",") if x.strip()]
+        tasks = mteb.get_tasks(tasks=task_names, languages=langs)
+    elif args.benchmark.strip():
+        tasks = mteb.get_tasks(benchmark=args.benchmark.strip(), languages=langs)
     else:
-        evaluation = MTEB(task_langs=task_langs)
+        raise ValueError("Either --tasks or --benchmark must be specified.")
 
-    model = DualMaskHFEmbedder(
+    cfg = HFEmbedderConfig(
         model_name_or_path=args.model_name_or_path,
-        device=args.device,
-        dtype=args.dtype,
-        max_length=args.max_length,
-        mask_mode=args.mask_mode,
-        pooling_bidir=args.pooling_bidir,
-        pooling_causal=args.pooling_causal,
-        normalize=args.normalize,
         attn_impl=args.attn_impl,
-        trust_remote_code=True,
+        mask_mode=args.mask_mode,
+        pooling=args.pooling,
+        max_length=args.max_length,
+        dtype=args.dtype,
+        device=args.device,
+        batch_size=args.batch_size,
+        normalize=args.normalize,
     )
+    model = HFEmbedder(cfg)
 
-    run_name = f"{os.path.basename(args.model_name_or_path.rstrip('/'))}__{args.mask_mode}__pb-{args.pooling_bidir}__pc-{args.pooling_causal}"
-    out_dir = os.path.join(args.output_dir, run_name)
-    if args.no_overwrite and os.path.exists(out_dir):
-        raise RuntimeError(f"output exists: {out_dir}")
+    run_name = f"{safe_name(args.model_name_or_path)}__{args.mask_mode}__{args.pooling}"
+    out_dir = os.path.join(args.output_folder, run_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    results = evaluation.run(
+    # --- evaluate ---
+    t0 = time.time()
+    results = mteb.evaluate(
         model,
+        tasks=tasks,
         output_folder=out_dir,
-        batch_size=args.batch_size,
+        overwrite=args.overwrite,
+        encode_kwargs={
+            "batch_size": args.batch_size,
+            "max_length": args.max_length,
+            "normalize": args.normalize,
+        },
     )
 
-    # Save a compact summary
-    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+    # also dump a top-level json for convenience
+    with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    print(f"[done] saved to: {out_dir}")
+    print(f"[done] output_folder={out_dir}  elapsed={(time.time()-t0):.1f}s")
+
+
+def safe_name(x: str) -> str:
+    return x.replace("/", "_").replace(":", "_").replace(" ", "_")
 
 
 if __name__ == "__main__":
