@@ -268,7 +268,6 @@ class DualMaskHFEncoder:
     def encode(
         self,
         inputs,                 # DataLoader[BatchedInput]
-        *,
         task_metadata=None,
         hf_split: str = "",
         hf_subset: str = "",
