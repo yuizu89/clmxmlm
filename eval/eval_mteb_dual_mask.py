@@ -38,6 +38,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from mteb.models import ModelMeta 
+
 # -------------------- FlexAttention mask functions (same as training) --------------------
 def causal_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
     return kv_idx <= q_idx
@@ -389,6 +391,13 @@ def main():
         hf_token=args.hf_token,
     )
     model = DualMaskHFEncoder(cfg)
+
+    model.mteb_model_meta = ModelMeta(
+        name=args.model_name_or_path,
+        revision="no_revision_available",
+        release_date=None,
+        languages=langs,
+    )
 
     run_name = (
         f"{safe_name(args.model_name_or_path)}__"
