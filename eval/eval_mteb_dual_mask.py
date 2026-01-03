@@ -526,9 +526,6 @@ def main():
         tasks,
         cache=cache,
         overwrite_strategy=args.overwrite_strategy,
-        # Optional but helps cache avoid "latest revision" warning
-        model_name=args.model_name_or_path,
-        model_revision=args.model_revision,
         encode_kwargs={"max_length": args.max_length},
     )
 
