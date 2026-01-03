@@ -270,6 +270,7 @@ class DualMaskHFEncoder:
     def encode(
         self,
         inputs,                 # DataLoader[BatchedInput]
+        *,
         task_metadata=None,
         hf_split: str = "",
         hf_subset: str = "",
@@ -317,6 +318,14 @@ class DualMaskHFEncoder:
             return np.zeros((0, self.get_sentence_embedding_dimension()), dtype=np.float32)
         return np.concatenate(all_vecs, axis=0)
 
+def to_iso_lang_script(lang: str) -> str:
+    # 最低限：英語だけ使うならこれでOK
+    if lang == "eng":
+        return "eng-Latn"
+    # 必要なら追加していく
+    if lang == "jpn":
+        return "jpn-Jpan"
+    return lang  # 既に "xxx-Scrp" 形式ならそのまま
 
 # -------------------- runner --------------------
 def parse_args():
@@ -392,11 +401,31 @@ def main():
     )
     model = DualMaskHFEncoder(cfg)
 
+    # --- fill ModelMeta (required fields) ---
+    n_params = sum(p.numel() for p in model.model.parameters())
+    max_tokens = getattr(model.model.config, "max_position_embeddings", None) or args.max_length
+    embed_dim = model.get_sentence_embedding_dimension()
+
     model.mteb_model_meta = ModelMeta(
+        loader=None,                         # ここでは evaluate が loader を使わない前提（主にメタ情報用）
+        loader_kwargs={},
         name=args.model_name_or_path,
-        revision="no_revision_available",
+        revision=None,                       # or "main"
         release_date=None,
-        languages=langs,
+        languages=[to_iso_lang_script(l) for l in langs],
+        n_parameters=int(n_params),
+        memory_usage_mb=None,
+        max_tokens=float(max_tokens) if max_tokens is not None else None,
+        embed_dim=int(embed_dim),
+        license=None,
+        open_weights=None,
+        public_training_code=None,
+        public_training_data=None,
+        framework=["PyTorch"],
+        reference=None,
+        similarity_fn_name="cosine",
+        use_instructions=False,
+        training_datasets=None,
     )
 
     run_name = (
