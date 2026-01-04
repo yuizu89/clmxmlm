@@ -1,839 +1,665 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import time
-import math
-import argparse
-import inspect
-import json
-import csv
-from typing import Optional, Iterator, List, Dict, Tuple
+"""
+MTEB v2 embedding eval for decoder-only CLM/MLM (dual-mask) models.
 
+MOST ROBUST workaround:
+- Do NOT rely on model.forward kwargs (mask_function/or_mask_function), which may be ignored.
+- Instead, build a FlexAttention BlockMask directly via torch.nn.attention.flex_attention.create_block_mask
+  and pass it as `attention_mask` (Transformers' attention interface supports BlockMask for flex_attention).
+
+This should make bidir != causal as long as:
+- torch supports flex_attention (PyTorch >= 2.5),
+- transformers actually uses flex_attention for the model,
+- and the model doesn't forcibly overwrite a BlockMask.
+
+Usage example:
+  python eval_mteb_dual_mask_blockmask.py \
+    --model_name_or_path Qwen/Qwen3-0.6B \
+    --mask_mode bidir \
+    --pooling_causal mean \
+    --languages eng \
+    --tasks Banking77Classification.v2
+"""
+
+import os
+import re
+import json
+import time
+import argparse
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Literal, Union
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import IterableDataset
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    TrainingArguments,
-    Trainer,
-    TrainerCallback,
-)
-
-
-# -------------------------- FlexAttention mask functions --------------------------
-def causal_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
-    return kv_idx <= q_idx
-
-def full_visible_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
-    return True
-
-
-# -------------------------- Tokenizer / mask token setup --------------------------
-def ensure_mask_token(tokenizer, model, mask_token: str = "<mask>") -> int:
-    """
-    Qwen系 tokenizer に <mask> を追加して mask_token_id を確保する。
-    - 追加で語彙が増えるが、CLMデータに <mask> が出現しない限り CLM loss への影響は実質ゼロ。
-    """
-    mask_id = getattr(tokenizer, "mask_token_id", None)
-    if mask_id is None:
-        num_added = tokenizer.add_special_tokens({"mask_token": mask_token})
-        mask_id = tokenizer.mask_token_id
-        if num_added > 0:
-            model.resize_token_embeddings(len(tokenizer))
-            if hasattr(model, "tie_weights"):
-                model.tie_weights()
-    if mask_id is None:
-        raise RuntimeError("mask_token_id を確保できませんでした。")
-    return int(mask_id)
-
-
-# -------------------------- Dataset: streaming fixed-length packing --------------------------
-class PackedStreamingIterable(IterableDataset):
-    def __init__(
-        self,
-        *,
-        tokenizer,
-        dataset_name: str,
-        dataset_config: Optional[str],
-        dataset_split: str,
-        text_column: str,
-        seqlen: int,
-        streaming: bool,
-        shuffle_buffer: int,
-        seed: int,
-        world_size: int,
-        rank: int,
-        add_eos_between_docs: bool = True,
-        add_bos_at_chunk_start: bool = False,
-        cache_dir: Optional[str] = None,
-    ):
-        super().__init__()
-        self.tok = tokenizer
-        self.name = dataset_name
-        self.config = dataset_config
-        self.split = dataset_split
-        self.text_key = text_column
-        self.seqlen = int(seqlen)
-        self.streaming = bool(streaming)
-        self.shuffle_buffer = int(shuffle_buffer)
-        self.seed = int(seed)
-        self.world_size = max(1, int(world_size))
-        self.rank = max(0, int(rank))
-        self.add_eos_between_docs = bool(add_eos_between_docs)
-        self.add_bos_at_chunk_start = bool(add_bos_at_chunk_start)
-        self.cache_dir = cache_dir
-        assert self.tok.eos_token_id is not None, "tokenizer に eos_token_id が必要です。"
-
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        ds = load_dataset(
-            self.name,
-            self.config if self.config else None,
-            split=self.split,
-            streaming=self.streaming,
-            cache_dir=self.cache_dir,
-        )
-        # HF streaming dataset は shard / shuffle を持つことが多い
-        if hasattr(ds, "shard"):
-            ds = ds.shard(num_shards=self.world_size, index=self.rank)
-        if hasattr(ds, "shuffle") and self.shuffle_buffer > 0:
-            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
-
-        eos = int(self.tok.eos_token_id)
-        buf: List[int] = []
-
-        for ex in ds:
-            txt = ex.get(self.text_key, "")
-            if not isinstance(txt, str) or not txt:
-                continue
-            ids = self.tok(txt, add_special_tokens=False, return_attention_mask=False)["input_ids"]
-            if self.add_eos_between_docs:
-                ids = ids + [eos]
-            buf.extend(ids)
-
-            while len(buf) >= self.seqlen:
-                chunk = buf[: self.seqlen]
-                buf = buf[self.seqlen :]
-                if self.add_bos_at_chunk_start and getattr(self.tok, "bos_token_id", None) is not None:
-                    chunk[0] = int(self.tok.bos_token_id)
-                yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
-
-
-# -------------------------- Collator --------------------------
-def clm_collate(examples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    input_ids = torch.stack([ex["input_ids"] for ex in examples], dim=0)  # (B,S)
-    attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-
-    # CLM: transformers の多くの CausalLM は labels を内部で shift して loss を計算するので、非shiftで渡すのが一般的
-    labels = input_ids.clone()
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
-
-
-# -------------------------- MLM helpers --------------------------
-def special_ids_from_tokenizer(tok) -> List[int]:
-    ids = []
-    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
-        v = getattr(tok, name, None)
-        if v is not None:
-            ids.append(int(v))
-    return sorted(set(ids))
-
-def choose_mlm_positions_random(
-    input_ids: torch.LongTensor,
-    mask_ratio: float,
-    special_ids: List[int],
-    rng: torch.Generator,
-) -> torch.BoolTensor:
-    B, S = input_ids.shape
-    device = input_ids.device
-    if mask_ratio <= 0.0:
-        return torch.zeros((B, S), dtype=torch.bool, device=device)
-
-    cand = torch.ones((B, S), dtype=torch.bool, device=device)
-    for sid in special_ids:
-        cand &= (input_ids != sid)
-
-    rnd = torch.rand((B, S), generator=rng, device=device)
-    sel = (rnd < mask_ratio) & cand
-
-    # ensure >=1 per row
-    any_row = sel.any(dim=1)
-    if (~any_row).any():
-        bad = torch.where(~any_row)[0].tolist()
-        for b in bad:
-            idxs = torch.where(cand[b])[0]
-            if idxs.numel() == 0:
-                idxs = torch.arange(S, device=device)
-            j = idxs[torch.randint(0, idxs.numel(), (1,), generator=rng, device=device)]
-            sel[b, j] = True
-    return sel
-
-
-# -------------------------- Norm helpers (per-GPU; no allreduce) --------------------------
-def _unwrap_model(model):
-    return getattr(model, "module", model)
-
-def local_grad_sumsq_and_numel(model) -> Tuple[float, int]:
-    """
-    per-GPU: sum(g^2) と要素数 numel を返す
-    """
-    m = _unwrap_model(model)
-    sumsq = 0.0
-    numel = 0
-    for p in m.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad.detach()
-        gf = g.float()
-        sumsq += float((gf * gf).sum().item())
-        numel += int(gf.numel())
-    return sumsq, numel
-
-def local_grad_norm(model) -> float:
-    sumsq, _ = local_grad_sumsq_and_numel(model)
-    return math.sqrt(max(sumsq, 1e-30))
-
-def local_grad_rms(model) -> float:
-    sumsq, n = local_grad_sumsq_and_numel(model)
-    if n <= 0:
-        return float("nan")
-    return math.sqrt(max(sumsq / float(n), 1e-30))
-
-def local_weight_norm(model) -> float:
-    m = _unwrap_model(model)
-    sq = 0.0
-    for p in m.parameters():
-        v = p.detach().float()
-        sq += float((v * v).sum().item())
-    return math.sqrt(max(sq, 1e-30))
-
-
-# -------------------------- Logging callback: JSONL + CSV --------------------------
-class JsonlCsvLoggerCallback(TrainerCallback):
-    """
-    Trainer の on_log を横取りして JSONL / CSV に追記保存する。
-    - process zero のみ保存（多重書き込み防止）
-    - CSV は固定カラム（足りないキーは空欄）
-    """
-    DEFAULT_FIELDS = [
-        "step", "epoch", "lr",
-        "loss", "loss_clm", "loss_mlm",
-        "tps_active", "tflops",
-        "grad_norm", "grad_norm_rms", "update_to_weight",
-        "grad_sim", "grad_norm_clm", "grad_norm_mlm",
-        "grad_norm_clm_rms", "grad_norm_mlm_rms",
-        "grad_sim_ms", "grad_sim_oom",
-    ]
-
-    def __init__(self, jsonl_path: Optional[str], csv_path: Optional[str], fields: Optional[List[str]] = None):
-        self.jsonl_path = jsonl_path
-        self.csv_path = csv_path
-        self.fields = fields or list(self.DEFAULT_FIELDS)
-        self._csv_inited = False
-
-    def _is_process_zero(self, args, state) -> bool:
-        # transformers の標準に寄せる
-        return getattr(state, "is_world_process_zero", True) if hasattr(state, "is_world_process_zero") else True
-
-    def _ensure_parent(self, path: str):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    def _init_csv_if_needed(self):
-        if self.csv_path is None or self._csv_inited:
-            return
-        self._ensure_parent(self.csv_path)
-        file_exists = os.path.exists(self.csv_path) and os.path.getsize(self.csv_path) > 0
-        if not file_exists:
-            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=self.fields)
-                w.writeheader()
-        self._csv_inited = True
-
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is None:
-            return
-        if not self._is_process_zero(args, state):
-            return
-
-        record = dict(logs)
-        # wallclock も欲しければ残す（任意）
-        record["_time"] = time.time()
-
-        # JSONL
-        if self.jsonl_path:
-            self._ensure_parent(self.jsonl_path)
-            with open(self.jsonl_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-        # CSV
-        if self.csv_path:
-            self._init_csv_if_needed()
-            row = {k: record.get(k, "") for k in self.fields}
-            with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=self.fields)
-                w.writerow(row)
-
-
-# -------------------------- Trainer --------------------------
-class CLMMLMTrainer(Trainer):
-    def __init__(
-        self,
-        *args,
-        mask_policy: str = "both",
-        mlm_mask_ratio: float = 0.15,
-        both_weights: str = "1.0,1.0",
-        attn_impl: str = "flex_attention",
-        mask_token_id: Optional[int] = None,
-        grad_sim: bool = False,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-
-        alias = {"causal": "clm", "bidir": "mlm"}
-        self.mask_policy = alias.get(mask_policy, mask_policy)
-        self.mlm_mask_ratio = float(mlm_mask_ratio)
-        self.attn_impl = attn_impl
-        self.is_flex = (attn_impl == "flex_attention")
-
-        need_mlm = self.mask_policy in ("mlm", "alternate", "both")
-        if need_mlm and not self.is_flex:
-            raise RuntimeError("MLM を含む学習には --attn_impl flex_attention が必要です。")
-
-        w = [float(x.strip()) for x in both_weights.split(",")]
-        if len(w) != 2:
-            raise ValueError("--both_weights は 'w_clm,w_mlm' の2要素で指定してください。")
-        self.w_clm, self.w_mlm = w
-
-        self.mask_token_id = mask_token_id if need_mlm else None
-        if need_mlm and self.mask_token_id is None:
-            raise RuntimeError("MLMを使うには mask_token_id が必要です。")
-
-        self.grad_sim_enabled = bool(grad_sim)
-        self._can_grad_sim = (self.mask_policy == "both")
-
-        # RNG（device上に置く：MLMマスク生成がGPUで完結）
-        dev = self.model.device
-        self._rng = torch.Generator(device=dev)
-        base_seed = int(getattr(self.args, "seed", 42))
-        local_rank = int(getattr(self.args, "local_rank", 0) or 0)
-        self._rng.manual_seed(base_seed + local_rank)
-
-        self._n_params = int(sum(p.numel() for p in self.model.parameters()))
-        self._reset_interval()
-
-        self._step_start_time: Optional[float] = None
-        self._micro_in_step: int = 0
-
-        self._pending_grad_stats: Optional[Dict[str, float]] = None
-        self._pending_grad_sim: Optional[Dict[str, float]] = None
-
-    def _reset_interval(self):
-        self._int_micro = 0
-        self._int_loss = 0.0
-        self._int_loss_clm = 0.0
-        self._int_loss_mlm = 0.0
-        self._int_loss_clm_n = 0
-        self._int_loss_mlm_n = 0
-        self._int_active_tokens = 0
-        self._int_tokens_base = 0
-        self._int_step_time = 0.0
-
-    def _mode_now(self) -> str:
-        if self.mask_policy in ("clm", "mlm", "both"):
-            return self.mask_policy
-        return "mlm" if (self.state.global_step % 2 == 1) else "clm"
-
-    def _build_mlm_batch(self, inputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        tok = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
-        special_ids = special_ids_from_tokenizer(tok)
-        input_ids = inputs["input_ids"]
-        sel = choose_mlm_positions_random(
-            input_ids=input_ids,
-            mask_ratio=self.mlm_mask_ratio,
-            special_ids=special_ids,
-            rng=self._rng,
-        )
-        x = input_ids.clone()
-        x[sel] = int(self.mask_token_id)
-        labels = torch.full_like(input_ids, -100)
-        labels[sel] = input_ids[sel]
-        return x, labels, int(sel.sum().item())
-
-    def _mlm_loss_from_logits(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        mask = labels != -100
-        if not mask.any():
-            return logits.sum() * 0.0
-        V = logits.size(-1)
-        return F.cross_entropy(logits[mask].view(-1, V), labels[mask].view(-1), reduction="mean")
-
-    def _compute_lr(self) -> float:
-        try:
-            return float(self._get_learning_rate())
-        except Exception:
-            opt = getattr(self, "optimizer", None)
-            if opt is None or len(opt.param_groups) == 0:
-                return float("nan")
-            return float(opt.param_groups[0].get("lr", float("nan")))
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        _ = kwargs.get("num_items_in_batch", None)
-
-        mode = self._mode_now()
-        B, S = inputs["input_ids"].shape
-        passes = 2 if mode == "both" else 1
-
-        def run_clm():
-            out = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs.get("attention_mask", None),
-                labels=inputs["labels"],
-                mask_function=(causal_mask_fn if self.is_flex else None),
-            )
-            active = int(B * max(0, S - 1))
-            return out.loss, active
-
-        def run_mlm():
-            x_mlm, y_mlm, nmask = self._build_mlm_batch(inputs)
-            out = model(
-                input_ids=x_mlm,
-                attention_mask=inputs.get("attention_mask", None),
-                labels=None,
-                mask_function=full_visible_mask_fn,
-            )
-            return self._mlm_loss_from_logits(out.logits, y_mlm), nmask
-
-        loss_clm = None
-        loss_mlm = None
-        active = 0
-
-        if mode == "clm":
-            loss_clm, active = run_clm()
-            loss_total = loss_clm
-        elif mode == "mlm":
-            loss_mlm, active = run_mlm()
-            loss_total = loss_mlm
-        else:
-            loss_clm, act_c = run_clm()
-            loss_mlm, act_m = run_mlm()
-            active = int(act_c + act_m)
-            loss_total = self.w_clm * loss_clm + self.w_mlm * loss_mlm
-
-        # accumulate (NO logging here)
-        self._int_micro += 1
-        self._int_loss += float(loss_total.detach().float().cpu())
-
-        if loss_clm is not None:
-            self._int_loss_clm += float(loss_clm.detach().float().cpu())
-            self._int_loss_clm_n += 1
-        if loss_mlm is not None:
-            self._int_loss_mlm += float(loss_mlm.detach().float().cpu())
-            self._int_loss_mlm_n += 1
-
-        self._int_active_tokens += int(active)
-        self._int_tokens_base += int(B * S * passes)
-
-        return (loss_total, None) if return_outputs else loss_total
-
-    def _compute_grad_sim_all_params(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """
-        grad_sim: cosine similarity between grad(loss_clm) and grad(loss_mlm).
-        - autograd.grad を使う（通常学習の backward とは別の “追加” 勾配計算）
-        - ★集計は GPU 上（dot/na/nb/numel）で行い、最後にスカラーのみ取り出す
-        """
-        device = self.model.device
-        t0 = time.time()
-        out: Dict[str, float] = {"grad_sim": float("nan"), "grad_sim_oom": 0.0}
-
-        params = [p for p in self.model.parameters() if p.requires_grad]
-
-        try:
-            with self.compute_loss_context_manager():
-                out_c = self.model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs.get("attention_mask", None),
-                    labels=inputs["labels"],
-                    mask_function=(causal_mask_fn if self.is_flex else None),
-                )
-                loss_clm = out_c.loss
-
-                x_mlm, y_mlm, _ = self._build_mlm_batch(inputs)
-                out_m = self.model(
-                    input_ids=x_mlm,
-                    attention_mask=inputs.get("attention_mask", None),
-                    labels=None,
-                    mask_function=full_visible_mask_fn,
-                )
-                loss_mlm = self._mlm_loss_from_logits(out_m.logits, y_mlm)
-
-            grads_c = torch.autograd.grad(loss_clm, params, allow_unused=True)
-            grads_m = torch.autograd.grad(loss_mlm, params, allow_unused=True)
-
-            dot = torch.zeros((), device=device, dtype=torch.float64)
-            na  = torch.zeros((), device=device, dtype=torch.float64)
-            nb  = torch.zeros((), device=device, dtype=torch.float64)
-            den = torch.zeros((), device=device, dtype=torch.float64)  # numel sum for RMS
-
-            for gc, gm in zip(grads_c, grads_m):
-                if gc is None or gm is None:
-                    continue
-                gc = gc.detach().float()
-                gm = gm.detach().float()
-                dot = dot + (gc * gm).sum(dtype=torch.float64)
-                na  = na  + (gc * gc).sum(dtype=torch.float64)
-                nb  = nb  + (gm * gm).sum(dtype=torch.float64)
-                den = den + float(gc.numel())
-
-            dotv = float(dot.item())
-            nav  = float(na.item())
-            nbv  = float(nb.item())
-            denv = float(den.item())
-
-            cos = dotv / (math.sqrt(max(nav, 1e-30)) * math.sqrt(max(nbv, 1e-30)) + 1e-30)
-
-            out["grad_sim"] = float(cos)
-            out["grad_norm_clm"] = math.sqrt(max(nav, 1e-30))
-            out["grad_norm_mlm"] = math.sqrt(max(nbv, 1e-30))
-
-            if denv > 0.0:
-                out["grad_norm_clm_rms"] = math.sqrt(max(nav / denv, 1e-30))
-                out["grad_norm_mlm_rms"] = math.sqrt(max(nbv / denv, 1e-30))
-
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "out of memory" in msg or "cuda oom" in msg:
-                out["grad_sim_oom"] = 1.0
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from mteb.models import ModelMeta
+
+
+# -------------------- pooling --------------------
+Pooling = Literal["mean", "last", "cls", "eos"]
+
+def pool_hidden(
+    last_hidden: torch.Tensor,          # (B, S, H)
+    attention_mask_2d: torch.Tensor,    # (B, S) 1=valid, 0=pad (NOTE: NOT BlockMask)
+    method: Pooling = "mean",
+    *,
+    input_ids: Optional[torch.Tensor] = None,  # (B,S) needed for eos
+    eos_token_id: Optional[int] = None,
+) -> torch.Tensor:
+    B, S, H = last_hidden.shape
+    am = attention_mask_2d.to(last_hidden.device).to(torch.long)
+
+    if method == "mean":
+        denom = am.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1)
+        x = (last_hidden * am.unsqueeze(-1)).sum(dim=1) / denom
+        return x
+
+    if method == "last":
+        idx = (am.sum(dim=1) - 1).clamp(min=0)  # (B,)
+        return last_hidden[torch.arange(B, device=last_hidden.device), idx]
+
+    if method == "cls":
+        return last_hidden[:, 0, :]
+
+    if method == "eos":
+        if input_ids is None or eos_token_id is None:
+            raise ValueError("pooling='eos' requires input_ids and eos_token_id.")
+        out = torch.empty((B, H), device=last_hidden.device, dtype=last_hidden.dtype)
+        for b in range(B):
+            row = input_ids[b]
+            eos_pos = torch.where(row == int(eos_token_id))[0]
+            if eos_pos.numel() > 0:
+                j = int(eos_pos[-1].item())
             else:
-                raise
-
-        out["grad_sim_ms"] = (time.time() - t0) * 1000.0
+                j = int((am[b].sum() - 1).clamp(min=0).item())
+            out[b] = last_hidden[b, j]
         return out
 
-    def _is_end_of_step(self) -> bool:
-        if getattr(self, "accelerator", None) is not None:
-            return bool(self.accelerator.sync_gradients)
-        gas = int(getattr(self.args, "gradient_accumulation_steps", 1))
-        return (self._micro_in_step % max(1, gas) == 0)
+    raise ValueError(f"unknown pooling: {method}")
 
-    def _get_grad_norm_and_rms(self) -> Tuple[float, float]:
-        """
-        - grad_norm: 可能なら deepspeed engine の global grad norm を優先（ZeRO-2 等）
-        - grad_norm_rms: per-GPU の local RMS
-        """
-        rms_local = float(local_grad_rms(self.model))
-        eng = getattr(self, "deepspeed", None)
-        if eng is not None and hasattr(eng, "get_global_grad_norm"):
-            try:
-                g = eng.get_global_grad_norm()
-                if isinstance(g, (float, int)):
-                    return float(g), rms_local
-                return float(getattr(g, "item", lambda: g)()), rms_local
-            except Exception:
-                pass
-        return float(local_grad_norm(self.model)), rms_local
 
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        self._micro_in_step += 1
+# -------------------- utils --------------------
+def safe_name(x: str) -> str:
+    x = x.rstrip("/").replace("\\", "/")
+    x = x.split("/")[-1] if "/" in x else x
+    x = re.sub(r"[^A-Za-z0-9._-]+", "_", x)
+    return x or "model"
 
-        if self._step_start_time is None:
-            self._step_start_time = time.time()
+def to_iso_lang_script(lang: str) -> str:
+    if lang == "eng":
+        return "eng-Latn"
+    if lang == "jpn":
+        return "jpn-Jpan"
+    return lang
 
+ArrayLike = Union[np.ndarray, torch.Tensor]
+
+def _to_torch(x: ArrayLike) -> torch.Tensor:
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x)
+    return x
+
+def cosine_sim_matrix(a: ArrayLike, b: ArrayLike) -> ArrayLike:
+    a_is_np = isinstance(a, np.ndarray)
+    b_is_np = isinstance(b, np.ndarray)
+    ta = _to_torch(a).float()
+    tb = _to_torch(b).float()
+
+    if ta.dim() == 1:
+        ta = ta.unsqueeze(0)
+    if tb.dim() == 1:
+        tb = tb.unsqueeze(0)
+
+    ta = F.normalize(ta, p=2, dim=-1)
+    tb = F.normalize(tb, p=2, dim=-1)
+    sim = ta @ tb.transpose(0, 1)
+
+    if a_is_np or b_is_np:
+        return sim.cpu().numpy()
+    return sim
+
+def cosine_sim_pairwise(a: ArrayLike, b: ArrayLike) -> ArrayLike:
+    a_is_np = isinstance(a, np.ndarray)
+    b_is_np = isinstance(b, np.ndarray)
+    ta = _to_torch(a).float()
+    tb = _to_torch(b).float()
+
+    if ta.dim() == 1:
+        ta = ta.unsqueeze(0)
+    if tb.dim() == 1:
+        tb = tb.unsqueeze(0)
+
+    ta = F.normalize(ta, p=2, dim=-1)
+    tb = F.normalize(tb, p=2, dim=-1)
+    sim = (ta * tb).sum(dim=-1)
+
+    if a_is_np or b_is_np:
+        return sim.cpu().numpy()
+    return sim
+
+
+# -------------------- config --------------------
+@dataclass
+class DualMaskConfig:
+    model_name_or_path: str
+    attn_impl: str = "flex_attention"
+    device: str = "cuda"
+    dtype: str = "bf16"                 # bf16/fp16/fp32
+    max_length: int = 512
+    normalize: bool = True
+
+    mask_mode: str = "bidir"            # bidir/causal/concat/avg
+    pooling_bidir: Pooling = "mean"
+    pooling_causal: Pooling = "mean"
+
+    hf_token: Optional[str] = None
+
+    # flex blockmask
+    block_size: int = 128               # BLOCK_SIZE for create_block_mask
+
+    # sanity / debug
+    sanity_check: bool = True
+    sanity_eps: float = 1e-6
+    sanity_fail: bool = True
+    sanity_text: str = "Hello world. This is a sanity check sentence for bidirectional masking."
+
+
+# -------------------- FlexAttention BlockMask builder --------------------
+def _get_num_query_heads(model) -> int:
+    cfg = getattr(model, "config", None)
+    n = getattr(cfg, "num_attention_heads", None) if cfg is not None else None
+    if isinstance(n, int) and n > 0:
+        return n
+    # fallback best-effort
+    for attr in ("n_head", "n_heads", "num_heads"):
+        v = getattr(cfg, attr, None) if cfg is not None else None
+        if isinstance(v, int) and v > 0:
+            return v
+    raise RuntimeError("Could not infer num_attention_heads from model.config. Please hardcode it.")
+
+def _make_block_mask_from_lengths(
+    lengths: torch.Tensor,  # (B,) int32/int64, number of valid tokens per row
+    S: int,
+    *,
+    mode: Literal["bidir", "causal"],
+    nheads: int,
+    device: torch.device,
+    block_size: int,
+):
+    """
+    Create a BlockMask that:
+      - masks out padding: only attends within each row length L_b
+      - if mode == causal: additionally kv_idx <= q_idx
+      - if mode == bidir: full visibility within non-pad region
+    """
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except Exception as e:
+        raise RuntimeError(
+            "PyTorch FlexAttention is not available. Need torch>=2.5 and CUDA build for flex_attention."
+        ) from e
+
+    # Ensure on device & int32 for cheap comparisons
+    lengths = lengths.to(device=device)
+    if lengths.dtype not in (torch.int32, torch.int64):
+        lengths = lengths.to(torch.int32)
+
+    # mask_mod can close over `lengths` tensor
+    def mask_mod(b, h, q_idx, kv_idx):
+        L = lengths[b]
+        valid = (q_idx < L) & (kv_idx < L)
+        if mode == "causal":
+            return valid & (kv_idx <= q_idx)
+        return valid  # bidir
+
+    # create_block_mask(mask_mod, B, H, Q_LEN, KV_LEN, device=..., BLOCK_SIZE=...)
+    B = int(lengths.shape[0])
+    return create_block_mask(
+        mask_mod,
+        B,
+        int(nheads),
+        int(S),
+        int(S),
+        device=device,
+        BLOCK_SIZE=int(block_size),
+    )
+
+
+class DualMaskHFEncoder:
+    def __init__(self, cfg: DualMaskConfig):
+        self.cfg = cfg
+
+        tok_kwargs = dict(use_fast=True, trust_remote_code=True)
+        if cfg.hf_token:
+            tok_kwargs["token"] = cfg.hf_token
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path, **tok_kwargs)
+
+        torch_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }[cfg.dtype]
+
+        model_kwargs = dict(attn_implementation=cfg.attn_impl, trust_remote_code=True, use_cache=False)
+        if cfg.hf_token:
+            model_kwargs["token"] = cfg.hf_token
+
+        # NOTE: some HF versions want torch_dtype, not dtype
         try:
-            loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                cfg.model_name_or_path,
+                torch_dtype=torch_dtype,
+                **model_kwargs,
+            )
         except TypeError:
-            loss = super().training_step(model, inputs)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                cfg.model_name_or_path,
+                dtype=torch_dtype,
+                **model_kwargs,
+            )
 
-        if self._is_end_of_step():
-            next_step = int(self.state.global_step) + 1
-            is_log_step = (self.args.logging_steps > 0) and (next_step % int(self.args.logging_steps) == 0)
+        # Hard-disable cache (important for consistent path)
+        self.model.config.use_cache = False
 
-            if is_log_step:
-                gnorm, grms = self._get_grad_norm_and_rms()
-                wnorm = float(local_weight_norm(self.model))
-                lr = float(self._compute_lr())
-                upd2w = lr * float(gnorm) / max(wnorm, 1e-30)
-                self._pending_grad_stats = {
-                    "grad_norm": float(gnorm),
-                    "grad_norm_rms": float(grms),
-                    "update_to_weight": float(upd2w),
-                }
+        self.model.eval()
+        self.device = torch.device(cfg.device if (cfg.device == "cpu" or torch.cuda.is_available()) else "cpu")
+        self.model.to(self.device)
 
-                if self.grad_sim_enabled and self._can_grad_sim:
-                    self._pending_grad_sim = self._compute_grad_sim_all_params(inputs)
+        self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        self.model_name = cfg.model_name_or_path
+        self.embedding_dim = getattr(self.model.config, "hidden_size", None)
 
-            step_dt = max(1e-9, time.time() - self._step_start_time)
-            self._int_step_time += float(step_dt)
-            self._step_start_time = None
-            self._micro_in_step = 0
+        mm = cfg.mask_mode
+        if mm not in ("bidir", "causal", "concat", "avg"):
+            raise ValueError("--mask_mode must be one of: bidir, causal, concat, avg")
 
-        return loss
+        # bidir requires flex_attention
+        need_bidir = mm in ("bidir", "concat", "avg")
+        if need_bidir and cfg.attn_impl != "flex_attention":
+            raise ValueError("bidir/concat/avg requires --attn_impl flex_attention.")
 
-    def log(self, logs: Dict[str, float], start_time: Optional[float] = None):
-        if any(k.startswith("eval_") for k in logs.keys()):
-            try:
-                return super().log(logs, start_time=start_time)
-            except TypeError:
-                return super().log(logs)
+        self._nheads = _get_num_query_heads(self.model)
 
-        dt = max(1e-9, float(self._int_step_time))
-        micro = max(1, int(self._int_micro))
+        self._mteb_model_meta: Optional[ModelMeta] = None
 
-        loss_avg = self._int_loss / micro
-        loss_clm = (self._int_loss_clm / max(1, self._int_loss_clm_n)) if self._int_loss_clm_n > 0 else float("nan")
-        loss_mlm = (self._int_loss_mlm / max(1, self._int_loss_mlm_n)) if self._int_loss_mlm_n > 0 else float("nan")
+        # sanity check (only when bidir is requested)
+        if need_bidir and cfg.sanity_check:
+            self._sanity_check_bidir_effect(eps=float(cfg.sanity_eps), fail=bool(cfg.sanity_fail))
 
-        tps_active = float(self._int_active_tokens) / dt
+    # ---- MTEB API ----
+    @property
+    def mteb_model_meta(self) -> ModelMeta:
+        if self._mteb_model_meta is None:
+            raise RuntimeError("mteb_model_meta is not set. Please set model.mteb_model_meta in main().")
+        return self._mteb_model_meta
 
-        # per-GPU TFLOPS estimate（world_size を掛けない）
-        flops_est = 6.0 * float(self._n_params) * float(self._int_tokens_base)
-        tflops = (flops_est / dt) / 1e12
+    @mteb_model_meta.setter
+    def mteb_model_meta(self, meta: ModelMeta) -> None:
+        self._mteb_model_meta = meta
 
-        step = int(self.state.global_step)
-        epoch = float(self.state.epoch) if self.state.epoch is not None else float("nan")
-        lr = float(self._compute_lr())
-        lr_disp = float(f"{lr:.8f}") if lr == lr else lr
+    def similarity(self, embeddings1: ArrayLike, embeddings2: ArrayLike) -> ArrayLike:
+        return cosine_sim_matrix(embeddings1, embeddings2)
 
-        out: Dict[str, float] = {
-            "step": step,
-            "epoch": round(epoch, 4) if epoch == epoch else epoch,
-            "lr": lr_disp,
-            "loss": round(float(loss_avg), 4),
-            "loss_clm": round(float(loss_clm), 4) if loss_clm == loss_clm else loss_clm,
-            "loss_mlm": round(float(loss_mlm), 4) if loss_mlm == loss_mlm else loss_mlm,
-            "tps_active": round(float(tps_active), 1),
-            "tflops": round(float(tflops), 2),
-        }
+    def similarity_pairwise(self, embeddings1: ArrayLike, embeddings2: ArrayLike) -> ArrayLike:
+        return cosine_sim_pairwise(embeddings1, embeddings2)
 
-        if self._pending_grad_stats is not None:
-            out["grad_norm"] = round(float(self._pending_grad_stats["grad_norm"]), 4)
-            out["grad_norm_rms"] = round(float(self._pending_grad_stats["grad_norm_rms"]), 6)
-            out["update_to_weight"] = round(float(self._pending_grad_stats["update_to_weight"]), 6)
-            self._pending_grad_stats = None
+    def get_sentence_embedding_dimension(self) -> int:
+        if self.embedding_dim is None:
+            raise RuntimeError("Could not infer hidden_size from model.config.")
+        if self.cfg.mask_mode == "concat":
+            return int(self.embedding_dim) * 2
+        return int(self.embedding_dim)
 
-        if self._pending_grad_sim is not None:
-            gs = self._pending_grad_sim
-            if "grad_sim" in gs and gs["grad_sim"] == gs["grad_sim"]:
-                out["grad_sim"] = round(float(gs["grad_sim"]), 6)
+    def _attn_impl_actual(self) -> str:
+        return str(
+            getattr(self.model.config, "_attn_implementation",
+                    getattr(self.model.config, "attn_implementation", "unknown"))
+        )
+
+    @torch.no_grad()
+    def _forward_hidden_blockmask(
+        self,
+        input_ids: torch.Tensor,         # (B,S)
+        attention_mask_2d: torch.Tensor, # (B,S) 1/0
+        mode: Literal["bidir", "causal"],
+    ) -> torch.Tensor:
+        """
+        Build BlockMask and pass it as attention_mask to the model forward.
+        Keep a separate 2D attention_mask for pooling (do NOT use BlockMask for pooling).
+        """
+        B, S = input_ids.shape
+        lengths = attention_mask_2d.sum(dim=1)  # (B,)
+
+        block_mask = _make_block_mask_from_lengths(
+            lengths=lengths,
+            S=int(S),
+            mode=mode,
+            nheads=self._nheads,
+            device=self.device,
+            block_size=self.cfg.block_size,
+        )
+
+        out = self.model(
+            input_ids=input_ids,
+            attention_mask=block_mask,   # <-- the key workaround
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+        return out.hidden_states[-1]
+
+    @torch.no_grad()
+    def _encode_texts_one_mode(self, texts: List[str], mode: Literal["bidir", "causal"], *, max_length: int) -> np.ndarray:
+        enc = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask_2d = enc["attention_mask"].to(self.device)
+
+        h = self._forward_hidden_blockmask(input_ids, attention_mask_2d, mode)
+
+        if mode == "bidir":
+            pooled = pool_hidden(
+                h, attention_mask_2d, self.cfg.pooling_bidir,
+                input_ids=input_ids, eos_token_id=self.eos_token_id
+            )
+        else:
+            pooled = pool_hidden(
+                h, attention_mask_2d, self.cfg.pooling_causal,
+                input_ids=input_ids, eos_token_id=self.eos_token_id
+            )
+
+        if self.cfg.normalize:
+            pooled = F.normalize(pooled, p=2, dim=-1)
+
+        return pooled.detach().float().cpu().numpy()
+
+    @staticmethod
+    def _coerce_text_list(x) -> List[str]:
+        if x is None:
+            return []
+        if isinstance(x, (tuple, list)) and len(x) > 0 and isinstance(x[0], (tuple, list)):
+            return [" ".join(map(str, xi)) for xi in x]
+        return [str(t) for t in x]
+
+    def encode(
+        self,
+        inputs,
+        *,
+        task_metadata=None,
+        hf_split: str = "",
+        hf_subset: str = "",
+        prompt_type=None,
+        **kwargs,
+    ) -> np.ndarray:
+        max_length = int(kwargs.get("max_length", self.cfg.max_length))
+        all_vecs: List[np.ndarray] = []
+        mm = self.cfg.mask_mode
+
+        for batch in inputs:
+            texts = batch.get("text", None)
+
+            if texts is None:
+                if "query" in batch:
+                    texts = batch["query"]
+                elif "title" in batch and "body" in batch:
+                    texts = [f"{t} {b}".strip() for t, b in zip(batch["title"], batch["body"])]
+                elif "text1" in batch and "text2" in batch:
+                    texts = [f"{a} {b}".strip() for a, b in zip(batch["text1"], batch["text2"])]
+
+            texts = self._coerce_text_list(texts)
+            if not texts:
+                raise ValueError(f"BatchedInput has no usable text field. keys={list(batch.keys())}")
+
+            if mm in ("bidir", "causal"):
+                v = self._encode_texts_one_mode(texts, mm, max_length=max_length)
+
+            elif mm == "concat":
+                a = self._encode_texts_one_mode(texts, "bidir", max_length=max_length)
+                b = self._encode_texts_one_mode(texts, "causal", max_length=max_length)
+                v = np.concatenate([a, b], axis=1)
+                if self.cfg.normalize:
+                    denom = np.linalg.norm(v, axis=1, keepdims=True)
+                    v = v / np.maximum(denom, 1e-12)
+
+            elif mm == "avg":
+                a = self._encode_texts_one_mode(texts, "bidir", max_length=max_length)
+                b = self._encode_texts_one_mode(texts, "causal", max_length=max_length)
+                v = (a + b) * 0.5
+                if self.cfg.normalize:
+                    denom = np.linalg.norm(v, axis=1, keepdims=True)
+                    v = v / np.maximum(denom, 1e-12)
+
             else:
-                out["grad_sim"] = gs.get("grad_sim", float("nan"))
+                raise ValueError(f"unknown mask_mode: {mm}")
 
-            if "grad_norm_clm" in gs:
-                out["grad_norm_clm"] = round(float(gs["grad_norm_clm"]), 4)
-            if "grad_norm_mlm" in gs:
-                out["grad_norm_mlm"] = round(float(gs["grad_norm_mlm"]), 4)
+            all_vecs.append(v)
 
-            if "grad_norm_clm_rms" in gs:
-                out["grad_norm_clm_rms"] = round(float(gs["grad_norm_clm_rms"]), 6)
-            if "grad_norm_mlm_rms" in gs:
-                out["grad_norm_mlm_rms"] = round(float(gs["grad_norm_mlm_rms"]), 6)
+        if not all_vecs:
+            return np.zeros((0, self.get_sentence_embedding_dimension()), dtype=np.float32)
+        return np.concatenate(all_vecs, axis=0)
 
-            out["grad_sim_ms"] = round(float(gs.get("grad_sim_ms", 0.0)), 2)
-            out["grad_sim_oom"] = float(gs.get("grad_sim_oom", 0.0))
-            self._pending_grad_sim = None
+    @torch.no_grad()
+    def _sanity_check_bidir_effect(self, eps: float = 1e-6, fail: bool = True):
+        """
+        Verify that bidir != causal in practice.
+        Prints:
+          - attn_impl actual
+          - max|diff| on hidden (all tokens, and excluding last token)
+          - max|diff| on pooled embedding
+        """
+        texts = [
+            self.cfg.sanity_text,
+            self.cfg.sanity_text + " Extra tail to change length a bit."
+        ]
+        enc = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=min(128, self.cfg.max_length),
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask_2d = enc["attention_mask"].to(self.device)
 
-        self._reset_interval()
+        h_c = self._forward_hidden_blockmask(input_ids, attention_mask_2d, "causal")
+        h_b = self._forward_hidden_blockmask(input_ids, attention_mask_2d, "bidir")
 
-        try:
-            return super().log(out, start_time=start_time)
-        except TypeError:
-            return super().log(out)
+        diff = (h_b - h_c).abs()
+        max_hidden = float(diff.max().item())
+        max_hidden_excl_last = float(diff[:, :-1].max().item()) if diff.size(1) > 1 else max_hidden
+
+        emb_c = pool_hidden(
+            h_c, attention_mask_2d, self.cfg.pooling_causal,
+            input_ids=input_ids, eos_token_id=self.eos_token_id
+        )
+        emb_b = pool_hidden(
+            h_b, attention_mask_2d, self.cfg.pooling_bidir,
+            input_ids=input_ids, eos_token_id=self.eos_token_id
+        )
+        if self.cfg.normalize:
+            emb_c = F.normalize(emb_c, p=2, dim=-1)
+            emb_b = F.normalize(emb_b, p=2, dim=-1)
+        max_emb = float((emb_b - emb_c).abs().max().item())
+
+        print("[sanity] attn_impl(requested)={} attn_impl(actual)={}".format(
+            self.cfg.attn_impl, self._attn_impl_actual()
+        ))
+        print("[sanity] num_query_heads={} block_size={}".format(self._nheads, self.cfg.block_size))
+        print("[sanity] max|bidir-causal| hidden(all)={:.3e} hidden(excl_last)={:.3e} emb={:.3e} eps={:.3e}".format(
+            max_hidden, max_hidden_excl_last, max_emb, eps
+        ))
+
+        if max_hidden_excl_last <= eps:
+            msg = (
+                "Sanity check failed: bidir seems identical to causal.\n"
+                "Even with BlockMask passed as attention_mask, the model produced identical hidden states.\n"
+                "This usually means either:\n"
+                "  - flex_attention was not actually used (fallback happened), OR\n"
+                "  - the model overwrote/ignored the BlockMask internally.\n"
+            )
+            if fail:
+                raise RuntimeError(msg)
+            else:
+                print("[sanity][WARN]\n" + msg)
 
 
-# -------------------------- CLI / main --------------------------
-def _str2bool(x: str) -> bool:
-    return str(x).lower() in ("1", "true", "yes", "y", "t")
-
+# -------------------- runner --------------------
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--model_name_or_path", type=str, required=True)
 
-    p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-0.6B")
+    # embedding behavior
+    p.add_argument("--mask_mode", type=str, default="bidir", choices=["bidir", "causal", "concat", "avg"])
+    p.add_argument("--pooling_bidir", type=str, default="mean", choices=["mean", "last", "cls", "eos"])
+    p.add_argument("--pooling_causal", type=str, default="mean", choices=["mean", "last", "cls", "eos"])
+    p.add_argument("--no_normalize", action="store_true", default=False)
+    p.add_argument("--max_length", type=int, default=512)
+
+    # runtime
+    p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+    p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--attn_impl", type=str, default="flex_attention",
                    choices=["flex_attention", "sdpa", "flash_attention_2", "eager"])
+    p.add_argument("--hf_token", type=str, default=None)
 
-    p.add_argument("--dataset_name", type=str, default="HuggingFaceFW/fineweb-edu")
-    p.add_argument("--dataset_config", type=str, default=None)
-    p.add_argument("--dataset_split", type=str, default="train")
-    p.add_argument("--text_column", type=str, default="text")
-    p.add_argument("--streaming", action="store_true", default=True)
-    p.add_argument("--shuffle_buffer", type=int, default=10_000)
-    p.add_argument("--seqlen", type=int, default=2048)
-    p.add_argument("--cache_dir", type=str, default=None)
-    p.add_argument("--add_bos_at_chunk_start", action="store_true", default=False)
+    # flex block mask
+    p.add_argument("--block_size", type=int, default=128)
 
-    p.add_argument("--mask_policy", type=str, default="both",
-                   choices=["clm", "mlm", "alternate", "both", "causal", "bidir"])
-    p.add_argument("--mlm_mask_ratio", type=float, default=0.15)
-    p.add_argument("--both_weights", type=str, default="1.0,1.0")
-    p.add_argument("--ensure_mask_token", type=_str2bool, default=True)
-    p.add_argument("--mask_token_str", type=str, default="<mask>")
+    # MTEB selection (v2)
+    p.add_argument("--languages", type=str, default="eng", help="comma-separated ISO639-3: e.g., eng,jpn")
+    p.add_argument("--tasks", type=str, default="", help="comma-separated task names, e.g. STS22.v2,Banking77Classification.v2")
+    p.add_argument("--benchmark", type=str, default="", help="benchmark name, e.g. 'MTEB(eng, v2)'")
 
-    p.add_argument("--grad_sim", type=_str2bool, default=False)
+    # results/cache
+    p.add_argument("--output_dir", type=str, default="mteb_results")
+    p.add_argument("--overwrite_strategy", type=str, default="only-missing",
+                   choices=["only-missing", "always", "never"])
 
-    p.add_argument("--output_dir", type=str, default="ckpt_out")
+    # Optional: pin model revision
+    p.add_argument("--model_revision", type=str, default=None)
 
-    # ---- logging outputs ----
-    p.add_argument("--logging_dir", type=str, default=None,
-                   help="TensorBoard event を保存するディレクトリ。未指定なら output_dir/runs")
-    p.add_argument("--report_to", type=str, default="none",
-                   help="transformers の report_to（例: none / tensorboard）。")
-    p.add_argument("--log_jsonl", type=str, default=None,
-                   help="学習ログを JSONL に追記保存するパス。未指定なら output_dir/train_log.jsonl")
-    p.add_argument("--log_csv", type=str, default=None,
-                   help="学習ログを CSV に追記保存するパス。未指定なら output_dir/train_log.csv")
-
-    p.add_argument("--per_device_train_batch_size", type=int, default=2)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=2e-5)
-    p.add_argument("--warmup_steps", type=int, default=100)
-    p.add_argument("--max_steps", type=int, default=1000)
-    p.add_argument("--weight_decay", type=float, default=0.1)
-    p.add_argument("--logging_steps", type=int, default=20)
-    p.add_argument("--save_steps", type=int, default=500)
-    p.add_argument("--save_total_limit", type=int, default=2)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--bf16", type=_str2bool, default=True)
-    p.add_argument("--fp16", type=_str2bool, default=False)
-    p.add_argument("--gradient_checkpointing", action="store_true")
-    p.add_argument("--ddp_find_unused_parameters", type=_str2bool, default=False)
-
-    p.add_argument("--deepspeed", type=str, default=None)
+    # sanity check knobs
+    p.add_argument("--no_sanity_check", action="store_true", default=False)
+    p.add_argument("--sanity_eps", type=float, default=1e-6)
+    p.add_argument("--sanity_fail", action="store_true", default=True)
+    p.add_argument("--sanity_text", type=str, default="Hello world. This is a sanity check sentence for bidirectional masking.")
 
     return p.parse_args()
 
+
 def main():
     args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-    # defaults for log paths
-    if args.logging_dir is None:
-        args.logging_dir = os.path.join(args.output_dir, "runs")
-    if args.log_jsonl is None:
-        args.log_jsonl = os.path.join(args.output_dir, "train_log.jsonl")
-    if args.log_csv is None:
-        args.log_csv = os.path.join(args.output_dir, "train_log.csv")
+    import mteb
+    from mteb.cache import ResultCache
 
-    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True, trust_remote_code=True)
+    langs = [x.strip() for x in args.languages.split(",") if x.strip()]
 
-    dtype = torch.bfloat16 if args.bf16 and torch.cuda.is_available() else (
-        torch.float16 if args.fp16 and torch.cuda.is_available() else torch.float32
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        attn_implementation=args.attn_impl,
-        use_cache=False,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-    )
-
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-
-    alias = {"causal": "clm", "bidir": "mlm"}
-    policy = alias.get(args.mask_policy, args.mask_policy)
-    need_mlm = policy in ("mlm", "alternate", "both")
-
-    mask_id = None
-    if need_mlm:
-        if args.ensure_mask_token:
-            mask_id = ensure_mask_token(tok, model, mask_token=args.mask_token_str)
-        else:
-            mask_id = getattr(tok, "mask_token_id", None)
-            if mask_id is None:
-                raise RuntimeError("mask_token_id がありません。--ensure_mask_token True を使ってください。")
-
-    train_ds = PackedStreamingIterable(
-        tokenizer=tok,
-        dataset_name=args.dataset_name,
-        dataset_config=args.dataset_config,
-        dataset_split=args.dataset_split,
-        text_column=args.text_column,
-        seqlen=args.seqlen,
-        streaming=args.streaming,
-        shuffle_buffer=args.shuffle_buffer,
-        seed=args.seed,
-        world_size=world_size,
-        rank=rank,
-        add_eos_between_docs=True,
-        add_bos_at_chunk_start=args.add_bos_at_chunk_start,
-        cache_dir=args.cache_dir,
-    )
-
-    # report_to は "none" 文字列を渡せば無効化される（transformers 標準挙動）
-    targs_kwargs = dict(
-        output_dir=args.output_dir,
-        logging_dir=args.logging_dir,
-        report_to=args.report_to,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        warmup_steps=args.warmup_steps,
-        max_steps=args.max_steps,
-        weight_decay=args.weight_decay,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        seed=args.seed,
-        bf16=args.bf16,
-        fp16=args.fp16,
-        gradient_checkpointing=args.gradient_checkpointing,
-        ddp_find_unused_parameters=args.ddp_find_unused_parameters,
-    )
-    if args.deepspeed:
-        targs_kwargs["deepspeed"] = args.deepspeed
-
-    targs = TrainingArguments(**targs_kwargs)
-
-    # tokenizer deprecation 回避
-    trainer_init_sig = inspect.signature(Trainer.__init__)
-    trainer_tokenizer_kw = {}
-    if "processing_class" in trainer_init_sig.parameters:
-        trainer_tokenizer_kw["processing_class"] = tok
+    # --- select tasks/benchmark ---
+    if args.tasks.strip():
+        task_names = [x.strip() for x in args.tasks.split(",") if x.strip()]
+        tasks = mteb.get_tasks(tasks=task_names, languages=langs)
     else:
-        trainer_tokenizer_kw["tokenizer"] = tok
+        bench_name = args.benchmark.strip() or f"MTEB({langs[0]}, v2)"
+        tasks = mteb.get_benchmark(bench_name)
 
-    trainer = CLMMLMTrainer(
-        model=model,
-        args=targs,
-        train_dataset=train_ds,
-        data_collator=clm_collate,
-        mask_policy=args.mask_policy,
-        mlm_mask_ratio=args.mlm_mask_ratio,
-        both_weights=args.both_weights,
+    cfg = DualMaskConfig(
+        model_name_or_path=args.model_name_or_path,
         attn_impl=args.attn_impl,
-        mask_token_id=mask_id,
-        grad_sim=args.grad_sim,
-        **trainer_tokenizer_kw,
+        device=args.device,
+        dtype=args.dtype,
+        max_length=args.max_length,
+        normalize=(not args.no_normalize),
+        mask_mode=args.mask_mode,
+        pooling_bidir=args.pooling_bidir,
+        pooling_causal=args.pooling_causal,
+        hf_token=args.hf_token,
+        block_size=int(args.block_size),
+        sanity_check=(not args.no_sanity_check),
+        sanity_eps=float(args.sanity_eps),
+        sanity_fail=bool(args.sanity_fail),
+        sanity_text=args.sanity_text,
+    )
+    model = DualMaskHFEncoder(cfg)
+
+    # --- fill ModelMeta ---
+    n_params = sum(p.numel() for p in model.model.parameters())
+    max_tokens = getattr(model.model.config, "max_position_embeddings", None) or args.max_length
+    embed_dim = model.get_sentence_embedding_dimension()
+
+    model.mteb_model_meta = ModelMeta(
+        loader=None,
+        loader_kwargs={},
+        name=args.model_name_or_path,
+        revision=args.model_revision,
+        release_date=None,
+        languages=[to_iso_lang_script(l) for l in langs],
+        n_parameters=int(n_params),
+        memory_usage_mb=None,
+        max_tokens=float(max_tokens) if max_tokens is not None else None,
+        embed_dim=int(embed_dim),
+        license=None,
+        open_weights=None,
+        public_training_code=None,
+        public_training_data=None,
+        framework=["PyTorch"],
+        reference=None,
+        similarity_fn_name="cosine",
+        use_instructions=False,
+        training_datasets=None,
     )
 
-    # JSONL/CSV logger
-    trainer.add_callback(JsonlCsvLoggerCallback(jsonl_path=args.log_jsonl, csv_path=args.log_csv))
+    run_name = (
+        f"{safe_name(args.model_name_or_path)}__"
+        f"{args.mask_mode}__"
+        f"pb-{args.pooling_bidir}__pc-{args.pooling_causal}__"
+        f"ml{args.max_length}__"
+        f"bs{args.block_size}"
+    )
+    out_dir = os.path.join(args.output_dir, run_name)
+    os.makedirs(out_dir, exist_ok=True)
 
-    if trainer.is_world_process_zero():
-        print({
-            "vocab_size": len(tok),
-            "mask_token": getattr(tok, "mask_token", None),
-            "mask_token_id": getattr(tok, "mask_token_id", None),
-            "attn_impl": args.attn_impl,
-            "mask_policy": args.mask_policy,
-            "logging_steps": int(args.logging_steps),
-            "grad_sim": bool(args.grad_sim),
-            "deepspeed": args.deepspeed,
-            "logging_dir": args.logging_dir,
-            "report_to": args.report_to,
-            "log_jsonl": args.log_jsonl,
-            "log_csv": args.log_csv,
-        })
+    cache = ResultCache(cache_path=out_dir)
 
-    trainer.train()
+    t0 = time.time()
+    results = mteb.evaluate(
+        model,
+        tasks,
+        cache=cache,
+        overwrite_strategy=args.overwrite_strategy,
+        encode_kwargs={"max_length": args.max_length},
+    )
 
-    if trainer.is_world_process_zero():
-        trainer.save_model(args.output_dir)
-        tok.save_pretrained(args.output_dir)
+    summary: Dict[str, Any] = {}
+    for r in results:
+        try:
+            summary[r.task_name] = {
+                "main_score": float(r.get_score()),
+                "metric": str(r.task.metadata.main_score),
+                "main_scores": r.only_main_score().to_dict(),
+            }
+        except Exception:
+            summary[r.task_name] = {"raw": str(r)}
+
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(f"[done] saved to: {out_dir}")
+    print(f"[done] elapsed: {(time.time()-t0):.1f}s")
+
 
 if __name__ == "__main__":
     main()
