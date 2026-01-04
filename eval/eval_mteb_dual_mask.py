@@ -19,6 +19,11 @@ Refinement (minimal, to be compatible with MTEB v2 RetrievalEvaluator):
 - Provide mteb_model_meta as a property (and allow setting)
 - Implement similarity() and similarity_pairwise() (cosine)
 - Small text-field fallback for Retrieval tasks (only when "text" is absent)
+
+Patch (IMPORTANT):
+- Add a sanity check to verify that bidir (full-visible) and causal produce DIFFERENT
+  hidden-states/embeddings. If they are identical, bidir is likely not enabled (mask ignored or
+  backend enforces causal).
 """
 
 import os
@@ -104,31 +109,37 @@ def _supports_mask_function(model) -> bool:
     - Many HF / trust_remote_code models expose forward as `forward(*args, **kwargs)`.
       In that case, `mask_function` won't appear in `inspect.signature`, but passing it
       may still work. So we treat presence of **kwargs as "supported".
-    - This is only a pre-check to avoid false negatives. If the model truly doesn't
-      support mask_function, the actual forward call will raise TypeError later.
     """
     try:
         sig = inspect.signature(model.forward)
         params = sig.parameters
 
-        # 1) Explicitly listed
         if "mask_function" in params:
             return True
 
-        # 2) Accepts **kwargs (VAR_KEYWORD) -> likely accepts mask_function too
         for p in params.values():
             if p.kind == inspect.Parameter.VAR_KEYWORD:
                 return True
 
         return False
-
     except Exception:
-        # If we can't introspect (wrappers, compiled, remote code), don't block bidir here.
         return True
 
+def _get_attn_impl_debug(model) -> Optional[str]:
+    """
+    Transformers のバージョン差/モデル差を吸収して、実際の attention 実装名っぽいものを引く。
+    取れない場合 None。
+    """
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return None
+    for k in ("_attn_implementation", "attn_implementation", "attn_impl"):
+        v = getattr(cfg, k, None)
+        if v is not None:
+            return str(v)
+    return None
 
 def to_iso_lang_script(lang: str) -> str:
-    # minimal mapping
     if lang == "eng":
         return "eng-Latn"
     if lang == "jpn":
@@ -137,17 +148,12 @@ def to_iso_lang_script(lang: str) -> str:
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
-
 def _to_torch(x: ArrayLike) -> torch.Tensor:
     if isinstance(x, np.ndarray):
         return torch.from_numpy(x)
     return x
 
 def cosine_sim_matrix(a: ArrayLike, b: ArrayLike) -> ArrayLike:
-    """
-    (N,D) x (M,D) -> (N,M) cosine similarity.
-    Return type matches input type: numpy -> numpy, torch -> torch.
-    """
     a_is_np = isinstance(a, np.ndarray)
     b_is_np = isinstance(b, np.ndarray)
     ta = _to_torch(a).float()
@@ -160,17 +166,13 @@ def cosine_sim_matrix(a: ArrayLike, b: ArrayLike) -> ArrayLike:
 
     ta = F.normalize(ta, p=2, dim=-1)
     tb = F.normalize(tb, p=2, dim=-1)
-    sim = ta @ tb.transpose(0, 1)  # (N,M)
+    sim = ta @ tb.transpose(0, 1)
 
     if a_is_np or b_is_np:
         return sim.cpu().numpy()
     return sim
 
 def cosine_sim_pairwise(a: ArrayLike, b: ArrayLike) -> ArrayLike:
-    """
-    (N,D) and (N,D) -> (N,) cosine similarity.
-    Return type matches input type: numpy -> numpy, torch -> torch.
-    """
     a_is_np = isinstance(a, np.ndarray)
     b_is_np = isinstance(b, np.ndarray)
     ta = _to_torch(a).float()
@@ -183,7 +185,7 @@ def cosine_sim_pairwise(a: ArrayLike, b: ArrayLike) -> ArrayLike:
 
     ta = F.normalize(ta, p=2, dim=-1)
     tb = F.normalize(tb, p=2, dim=-1)
-    sim = (ta * tb).sum(dim=-1)  # (N,)
+    sim = (ta * tb).sum(dim=-1)
 
     if a_is_np or b_is_np:
         return sim.cpu().numpy()
@@ -206,6 +208,11 @@ class DualMaskConfig:
 
     hf_token: Optional[str] = None      # for gated/private models
 
+    # ---- patch options ----
+    sanity_check: bool = True           # bidir を使うときに mask が効いているか検査する
+    sanity_eps: float = 1e-6            # max|bidir-causal| がこれ未満なら「効いてない」扱い
+    sanity_max_len: int = 64            # sanity check 時の max_length
+
 
 class DualMaskHFEncoder:
     """
@@ -214,6 +221,7 @@ class DualMaskHFEncoder:
     Keeps your original encoding behavior; adds:
       - similarity / similarity_pairwise (cosine)
       - mteb_model_meta as property (+ setter)
+      - sanity check that bidir differs from causal (otherwise mask_function is likely ignored)
     """
 
     def __init__(self, cfg: DualMaskConfig):
@@ -260,12 +268,15 @@ class DualMaskHFEncoder:
         if mm not in ("bidir", "causal", "concat", "avg"):
             raise ValueError("--mask_mode must be one of: bidir, causal, concat, avg")
 
-        # bidir requires flex_attention + mask_function support
+        # bidir requires flex_attention + mask_function acceptability
         need_bidir = mm in ("bidir", "concat", "avg")
         if need_bidir and cfg.attn_impl != "flex_attention":
             raise ValueError("bidir/concat/avg requires --attn_impl flex_attention.")
         if need_bidir and not _supports_mask_function(self.model):
-            raise ValueError("This model forward() does not appear to accept mask_function; bidir is not available.")
+            raise ValueError(
+                "This model forward() does not appear to accept mask_function "
+                "(no explicit arg and no **kwargs). bidir is not available."
+            )
 
         # name + dim
         self.model_name = cfg.model_name_or_path
@@ -273,6 +284,73 @@ class DualMaskHFEncoder:
 
         # MTEB meta backing field (set from main)
         self._mteb_model_meta: Optional[ModelMeta] = None
+
+        # ---- patch: sanity check for bidir effectiveness ----
+        if need_bidir and cfg.sanity_check:
+            self._sanity_check_bidir_effect(
+                eps=float(cfg.sanity_eps),
+                max_len=int(cfg.sanity_max_len),
+            )
+
+    # ---- patch helper ----
+    @torch.no_grad()
+    def _sanity_check_bidir_effect(self, *, eps: float, max_len: int) -> None:
+        """
+        Verify that bidir and causal produce different activations/embeddings.
+        If identical, mask_function is likely ignored or backend forces causal.
+        """
+        if self.cfg.attn_impl != "flex_attention":
+            print("[sanity] skipped: attn_impl is not flex_attention")
+            return
+        if self.device.type != "cuda":
+            print("[sanity] skipped: device is not cuda")
+            return
+
+        texts = [
+            "hello world",
+            "The quick brown fox jumps over the lazy dog.",
+        ]
+        enc = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=min(max_len, self.cfg.max_length),
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask = enc["attention_mask"].to(self.device)
+
+        # Hidden-state difference (most direct)
+        h_c = self._forward_hidden(input_ids, attention_mask, "causal").float()
+        h_b = self._forward_hidden(input_ids, attention_mask, "bidir").float()
+        diff_h = float((h_b - h_c).abs().max().item())
+
+        # Also check pooled embeddings difference (secondary signal)
+        e_c = self._encode_texts_one_mode(texts, "causal", max_length=min(max_len, self.cfg.max_length))
+        e_b = self._encode_texts_one_mode(texts, "bidir",  max_length=min(max_len, self.cfg.max_length))
+        diff_e = float(np.max(np.abs(e_b - e_c)))
+
+        impl_actual = _get_attn_impl_debug(self.model)
+        print(
+            "[sanity] "
+            f"attn_impl(requested)={self.cfg.attn_impl} "
+            f"attn_impl(actual)={impl_actual} "
+            f"max|bidir-causal| hidden={diff_h:.3e} emb={diff_e:.3e} eps={eps:.3e}"
+        )
+
+        if diff_h < eps and diff_e < eps:
+            raise RuntimeError(
+                "Sanity check failed: bidir seems identical to causal.\n"
+                "This likely means:\n"
+                "  - mask_function is ignored by the model/attention implementation, OR\n"
+                "  - the backend still enforces causal masking, OR\n"
+                "  - flex_attention is not actually active (fallback).\n"
+                "Try:\n"
+                "  - Verify transformers version supports flex_attention for your model.\n"
+                "  - Print attn_impl(actual) above; if not 'flex_attention', it's a fallback.\n"
+                "  - Consider using concat/avg only after bidir is truly effective.\n"
+            )
 
     # ---- MTEB-required-ish helpers ----
     @property
@@ -286,11 +364,9 @@ class DualMaskHFEncoder:
         self._mteb_model_meta = meta
 
     def similarity(self, embeddings1: ArrayLike, embeddings2: ArrayLike) -> ArrayLike:
-        # Cosine similarity matrix
         return cosine_sim_matrix(embeddings1, embeddings2)
 
     def similarity_pairwise(self, embeddings1: ArrayLike, embeddings2: ArrayLike) -> ArrayLike:
-        # Pairwise cosine similarity
         return cosine_sim_pairwise(embeddings1, embeddings2)
 
     # ---- original interface ----
@@ -350,7 +426,6 @@ class DualMaskHFEncoder:
                 input_ids=input_ids, eos_token_id=self.eos_token_id
             )
 
-        # Keep original behavior: normalize embeddings if cfg.normalize
         if self.cfg.normalize:
             pooled = F.normalize(pooled, p=2, dim=-1)
 
@@ -358,10 +433,6 @@ class DualMaskHFEncoder:
 
     @staticmethod
     def _coerce_text_list(x) -> List[str]:
-        """
-        BatchedInput field can be list[str] or list[list[str]] depending on task.
-        - if list[list[str]], join with whitespace.
-        """
         if x is None:
             return []
         if isinstance(x, (tuple, list)) and len(x) > 0 and isinstance(x[0], (tuple, list)):
@@ -384,7 +455,6 @@ class DualMaskHFEncoder:
         mm = self.cfg.mask_mode
 
         for batch in inputs:
-            # Original behavior: use "text" field.
             texts = batch.get("text", None)
 
             # Minimal safe fallback for Retrieval tasks (only when "text" absent)
@@ -468,6 +538,14 @@ def parse_args():
     p.add_argument("--model_revision", type=str, default=None,
                    help="HF revision (e.g., 'main', tag, or commit hash).")
 
+    # ---- patch options ----
+    p.add_argument("--no_sanity_check", action="store_true", default=False,
+                   help="Disable bidir-vs-causal sanity check.")
+    p.add_argument("--sanity_eps", type=float, default=1e-6,
+                   help="If max|bidir-causal| < eps, treat as identical (bidir ineffective).")
+    p.add_argument("--sanity_max_len", type=int, default=64,
+                   help="Max length used for sanity check forward.")
+
     return p.parse_args()
 
 
@@ -501,6 +579,9 @@ def main():
         pooling_bidir=args.pooling_bidir,
         pooling_causal=args.pooling_causal,
         hf_token=args.hf_token,
+        sanity_check=(not args.no_sanity_check),
+        sanity_eps=float(args.sanity_eps),
+        sanity_max_len=int(args.sanity_max_len),
     )
     model = DualMaskHFEncoder(cfg)
 
