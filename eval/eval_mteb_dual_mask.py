@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Evaluate a CLM/MLM-capable decoder-only model as an embedding model on MTEB (v2 API).
+Evaluate a decoder-only model as an embedding model on MTEB (v2 API) with
+causal/bidir switching via `is_causal`.
 
-Patch:
-- Add robust sanity-check that verifies bidir mask is EFFECTIVE (hidden differs from causal).
-- For bidir, prefer `or_mask_function=full_visible_mask_fn` (Transformers mask utils path).
-  Fallback to `mask_function=full_visible_mask_fn` if `or_mask_function` isn't accepted.
-- Print which mask kwargs were actually used.
+Changes vs your original:
+- Use AutoModel (base model) instead of AutoModelForCausalLM.
+- Remove flex_attention mask_function/or_mask_function logic (not used).
+- Switch masking by toggling `is_causal=True/False` (and ALSO force module.is_causal for robustness).
+- Simplify sanity check accordingly (checks hidden differs between is_causal True/False).
 """
 
 import os
@@ -19,24 +20,14 @@ import argparse
 import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Literal, Union
+from contextlib import contextmanager
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel
 
 from mteb.models import ModelMeta
-
-
-# -------------------- FlexAttention mask functions (same as training) --------------------
-def causal_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
-    return kv_idx <= q_idx
-
-def full_visible_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
-    return True
-
-def all_false_mask_fn(batch_idx: int, head_idx: int, q_idx: int, kv_idx: int) -> bool:
-    return False
 
 
 # -------------------- pooling --------------------
@@ -89,22 +80,15 @@ def safe_name(x: str) -> str:
     x = re.sub(r"[^A-Za-z0-9._-]+", "_", x)
     return x or "model"
 
-def _forward_accepts_any_kwargs(model) -> bool:
-    try:
-        sig = inspect.signature(model.forward)
-        for p in sig.parameters.values():
-            if p.kind == inspect.Parameter.VAR_KEYWORD:
-                return True
-        return False
-    except Exception:
-        return True
+def to_iso_lang_script(lang: str) -> str:
+    if lang == "eng":
+        return "eng-Latn"
+    if lang == "jpn":
+        return "jpn-Jpan"
+    return lang
 
 def _forward_accepts_param(model, name: str) -> bool:
-    """
-    Conservative check:
-    - If forward explicitly has `name`, True.
-    - Else if forward has **kwargs, True (might be accepted but still ignored internally).
-    """
+    """Best-effort signature check."""
     try:
         sig = inspect.signature(model.forward)
         if name in sig.parameters:
@@ -115,13 +99,6 @@ def _forward_accepts_param(model, name: str) -> bool:
         return False
     except Exception:
         return True
-
-def to_iso_lang_script(lang: str) -> str:
-    if lang == "eng":
-        return "eng-Latn"
-    if lang == "jpn":
-        return "jpn-Jpan"
-    return lang
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
@@ -169,17 +146,42 @@ def cosine_sim_pairwise(a: ArrayLike, b: ArrayLike) -> ArrayLike:
     return sim
 
 
+@contextmanager
+def force_module_is_causal(model: torch.nn.Module, flag: bool):
+    """
+    Robustness for FA2/other paths that consult module.is_causal internally.
+    Temporarily overwrites `.is_causal` on all submodules that have it.
+    """
+    touched = []
+    for m in model.modules():
+        if hasattr(m, "is_causal"):
+            try:
+                old = bool(getattr(m, "is_causal"))
+                setattr(m, "is_causal", bool(flag))
+                touched.append((m, old))
+            except Exception:
+                pass
+    try:
+        yield
+    finally:
+        for m, old in touched:
+            try:
+                setattr(m, "is_causal", old)
+            except Exception:
+                pass
+
+
 # -------------------- config --------------------
 @dataclass
 class DualMaskConfig:
     model_name_or_path: str
-    attn_impl: str = "flex_attention"
+    attn_impl: str = "flash_attention_2"  # fast default
     device: str = "cuda"
-    dtype: str = "bf16"                 # bf16/fp16/fp32
+    dtype: str = "bf16"                  # bf16/fp16/fp32
     max_length: int = 512
     normalize: bool = True
 
-    mask_mode: str = "bidir"            # bidir/causal/concat/avg
+    mask_mode: str = "bidir"             # bidir/causal/concat/avg
     pooling_bidir: Pooling = "mean"
     pooling_causal: Pooling = "mean"
 
@@ -188,7 +190,7 @@ class DualMaskConfig:
     # sanity / debug
     sanity_check: bool = True
     sanity_eps: float = 1e-6
-    sanity_fail: bool = True            # if True: raise on failure; else: warn and continue
+    sanity_fail: bool = True
     sanity_text: str = "Hello world. This is a sanity check sentence for bidirectional masking."
 
 
@@ -211,15 +213,16 @@ class DualMaskHFEncoder:
         if cfg.hf_token:
             model_kwargs["token"] = cfg.hf_token
 
-        # NOTE: some HF versions want torch_dtype, not dtype
+        # Use AutoModel (base) for embeddings / hidden states
         try:
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.model = AutoModel.from_pretrained(
                 cfg.model_name_or_path,
                 torch_dtype=torch_dtype,
                 **model_kwargs,
             )
         except TypeError:
-            self.model = AutoModelForCausalLM.from_pretrained(
+            # some environments may want dtype=
+            self.model = AutoModel.from_pretrained(
                 cfg.model_name_or_path,
                 dtype=torch_dtype,
                 **model_kwargs,
@@ -235,15 +238,8 @@ class DualMaskHFEncoder:
         if mm not in ("bidir", "causal", "concat", "avg"):
             raise ValueError("--mask_mode must be one of: bidir, causal, concat, avg")
 
-        # bidir requires flex_attention
-        need_bidir = mm in ("bidir", "concat", "avg")
-        if need_bidir and cfg.attn_impl != "flex_attention":
-            raise ValueError("bidir/concat/avg requires --attn_impl flex_attention.")
-
-        # detect forward kwargs (best-effort)
-        self._accepts_mask_function = _forward_accepts_param(self.model, "mask_function")
-        self._accepts_or_mask_function = _forward_accepts_param(self.model, "or_mask_function")
-        self._accepts_and_mask_function = _forward_accepts_param(self.model, "and_mask_function")
+        # detect whether forward accepts is_causal kw (best-effort; may still be ignored downstream)
+        self._accepts_is_causal = _forward_accepts_param(self.model, "is_causal")
 
         # name + dim
         self.model_name = cfg.model_name_or_path
@@ -251,10 +247,8 @@ class DualMaskHFEncoder:
 
         self._mteb_model_meta: Optional[ModelMeta] = None
 
-        # keep last used mask kwargs for debug prints
-        self._last_mask_kwargs: Dict[str, Any] = {}
-
-        # sanity check (only when bidir is requested)
+        # sanity check (only when bidir is relevant)
+        need_bidir = mm in ("bidir", "concat", "avg")
         if need_bidir and cfg.sanity_check:
             self._sanity_check_bidir_effect(eps=float(cfg.sanity_eps), fail=bool(cfg.sanity_fail))
 
@@ -282,18 +276,23 @@ class DualMaskHFEncoder:
         return int(self.embedding_dim)
 
     def _attn_impl_actual(self) -> str:
-        # best-effort: transformers stores this in config
-        return str(getattr(self.model.config, "_attn_implementation", getattr(self.model.config, "attn_implementation", "unknown")))
+        return str(getattr(self.model.config, "_attn_implementation",
+                           getattr(self.model.config, "attn_implementation", "unknown")))
+
+    def _pick_last_hidden(self, out) -> torch.Tensor:
+        # AutoModel typically returns last_hidden_state; request hidden_states for robustness.
+        if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            return out.last_hidden_state
+        if hasattr(out, "hidden_states") and out.hidden_states is not None:
+            return out.hidden_states[-1]
+        raise RuntimeError("Model output has neither last_hidden_state nor hidden_states.")
 
     @torch.no_grad()
     def _forward_hidden(self, input_ids, attention_mask, mode: Literal["bidir", "causal"]):
         """
-        Key patch:
-        - For bidir: try `or_mask_function=full_visible_mask_fn` first (preferred path).
-          Fallback to `mask_function=full_visible_mask_fn` if needed.
-        - For causal: keep default causal behavior; optionally pass mask_function=causal_mask_fn if supported.
+        Switch via is_causal, plus robust module.is_causal override.
         """
-        assert self.cfg.attn_impl == "flex_attention", "bidir path requires flex_attention"
+        want_causal = (mode == "causal")
 
         base_kwargs = dict(
             input_ids=input_ids,
@@ -303,34 +302,20 @@ class DualMaskHFEncoder:
             use_cache=False,
         )
 
-        mask_kwargs: Dict[str, Any] = {}
-        if mode == "bidir":
-            # Preferred: OR the causal mask with "all True" -> full visible (except padding).
-            if self._accepts_or_mask_function:
-                mask_kwargs["or_mask_function"] = full_visible_mask_fn
-            # fallback (older/custom code paths)
-            elif self._accepts_mask_function:
-                mask_kwargs["mask_function"] = full_visible_mask_fn
+        used_is_causal_kw = False
+
+        with force_module_is_causal(self.model, want_causal):
+            if self._accepts_is_causal:
+                try:
+                    out = self.model(**base_kwargs, is_causal=want_causal)
+                    used_is_causal_kw = True
+                except TypeError:
+                    out = self.model(**base_kwargs)
             else:
-                # No known hook, rely on default (but then bidir likely impossible)
-                mask_kwargs = {}
+                out = self.model(**base_kwargs)
 
-        else:  # causal
-            if self._accepts_mask_function:
-                mask_kwargs["mask_function"] = causal_mask_fn
-            # else: do nothing (default causal)
-
-        self._last_mask_kwargs = dict(mask_kwargs)
-
-        # Try forward; if TypeError (unexpected kwargs), progressively drop.
-        try:
-            out = self.model(**base_kwargs, **mask_kwargs)
-        except TypeError as e:
-            # Drop unknown hooks and retry as fallback.
-            retry_kwargs = dict(base_kwargs)
-            out = self.model(**retry_kwargs)
-
-        return out.hidden_states[-1]
+        h = self._pick_last_hidden(out)
+        return h, used_is_causal_kw
 
     @torch.no_grad()
     def _encode_texts_one_mode(self, texts: List[str], mode: Literal["bidir", "causal"], *, max_length: int) -> np.ndarray:
@@ -345,7 +330,8 @@ class DualMaskHFEncoder:
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
 
-        h = self._forward_hidden(input_ids, attention_mask, mode)
+        h, _ = self._forward_hidden(input_ids, attention_mask, mode)
+
         if mode == "bidir":
             pooled = pool_hidden(
                 h, attention_mask, self.cfg.pooling_bidir,
@@ -430,13 +416,8 @@ class DualMaskHFEncoder:
     @torch.no_grad()
     def _sanity_check_bidir_effect(self, eps: float = 1e-6, fail: bool = True):
         """
-        Verify that bidir != causal in practice.
-        Prints:
-          - which kwargs were used for bidir/causal
-          - max|diff| on hidden (all tokens, and excluding last token)
-          - max|diff| on pooled embedding (for current pooling setup)
+        Verify that bidir != causal in practice, using is_causal switching.
         """
-        # Build a batch that will produce padding + multiple tokens
         texts = [
             self.cfg.sanity_text,
             self.cfg.sanity_text + " Extra tail to change length a bit."
@@ -453,19 +434,14 @@ class DualMaskHFEncoder:
         attention_mask = enc["attention_mask"].to(self.device)
 
         # causal
-        h_c = self._forward_hidden(input_ids, attention_mask, "causal")
-        causal_kwargs = dict(self._last_mask_kwargs)
-
+        h_c, used_kw_c = self._forward_hidden(input_ids, attention_mask, "causal")
         # bidir
-        h_b = self._forward_hidden(input_ids, attention_mask, "bidir")
-        bidir_kwargs = dict(self._last_mask_kwargs)
+        h_b, used_kw_b = self._forward_hidden(input_ids, attention_mask, "bidir")
 
-        # diffs
         diff = (h_b - h_c).abs()
         max_hidden = float(diff.max().item())
         max_hidden_excl_last = float(diff[:, :-1].max().item()) if diff.size(1) > 1 else max_hidden
 
-        # pooled diffs under current pooling config
         emb_c = pool_hidden(
             h_c, attention_mask, self.cfg.pooling_causal,
             input_ids=input_ids, eos_token_id=self.eos_token_id
@@ -479,16 +455,13 @@ class DualMaskHFEncoder:
             emb_b = F.normalize(emb_b, p=2, dim=-1)
         max_emb = float((emb_b - emb_c).abs().max().item())
 
-        print(
-            "[sanity] attn_impl(requested)={} attn_impl(actual)={}".format(
-                self.cfg.attn_impl, self._attn_impl_actual()
-            )
-        )
-        print("[sanity] forward accepts: mask_function={} or_mask_function={} and_mask_function={}".format(
-            self._accepts_mask_function, self._accepts_or_mask_function, self._accepts_and_mask_function
+        print("[sanity] attn_impl(requested)={} attn_impl(actual)={}".format(
+            self.cfg.attn_impl, self._attn_impl_actual()
         ))
-        print("[sanity] causal kwargs used =", causal_kwargs)
-        print("[sanity] bidir  kwargs used =", bidir_kwargs)
+        print("[sanity] forward accepts is_causal={} (kw used: causal={}, bidir={})".format(
+            self._accepts_is_causal, used_kw_c, used_kw_b
+        ))
+        print("[sanity] module.is_causal override is ALWAYS applied for robustness (see code).")
         print("[sanity] max|bidir-causal| hidden(all)={:.3e} hidden(excl_last)={:.3e} emb={:.3e} eps={:.3e}".format(
             max_hidden, max_hidden_excl_last, max_emb, eps
         ))
@@ -497,12 +470,12 @@ class DualMaskHFEncoder:
             msg = (
                 "Sanity check failed: bidir seems identical to causal.\n"
                 "This likely means:\n"
-                "  - bidir hooks (or_mask_function/mask_function) are ignored, OR\n"
-                "  - backend still enforces causal masking, OR\n"
-                "  - flex_attention is not actually applying the custom mask.\n"
+                "  - attention backend still enforces causal masking, OR\n"
+                "  - model builds/overrides a causal mask internally (e.g., converts attention_mask -> 4D causal), OR\n"
+                "  - is_causal/module.is_causal is ignored in this code path.\n"
                 "Next steps:\n"
-                "  - Ensure torch/transformers versions support flex_attention masking for this model.\n"
-                "  - If still identical, you will need a model-side patch to disable causal enforcement.\n"
+                "  - Try --attn_impl sdpa (often respects is_causal more consistently).\n"
+                "  - If still identical, a model-side patch may be required (disable causal enforcement in model code).\n"
             )
             if fail:
                 raise RuntimeError(msg)
@@ -525,8 +498,8 @@ def parse_args():
     # runtime
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
-    p.add_argument("--attn_impl", type=str, default="flex_attention",
-                   choices=["flex_attention", "sdpa", "flash_attention_2", "eager"])
+    p.add_argument("--attn_impl", type=str, default="flash_attention_2",
+                   choices=["sdpa", "flash_attention_2", "eager", "flex_attention"])
     p.add_argument("--hf_token", type=str, default=None)
 
     # MTEB selection (v2)
