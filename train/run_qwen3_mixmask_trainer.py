@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-CLM/MLM (dual-mode via is_causal) trainer for decoder-only models using AutoModel.
+CLM/MLM (dual-mode via is_causal) trainer for decoder-only models using AutoModelForCausalLM.
 
-- Use AutoModel (base) + tied LM head to avoid AutoModelForCausalLM forcing causal.
-- Switch attention behavior with:
-    * forward kw: is_causal=True/False (if accepted)
-    * and robust override: module.is_causal=True/False (FlashAttention2 consults this path)
-- Supports flash_attention_2 for BOTH CLM and MLM as long as dtype is bf16/fp16.
-
-Keeps important training diagnostics from the original code:
-- grad_norm, grad_norm_rms (local RMS), update_to_weight
-- grad_sim (cosine similarity between grad(loss_clm) and grad(loss_mlm)) for mask_policy=both
-- grad_norm_clm/mlm and RMS, grad_sim_ms, grad_sim_oom
-- JSONL/CSV logging with fixed columns
+Key idea:
+- Load AutoModelForCausalLM (so saving/tie-weights are handled safely by HF).
+- For CLM: call the full model (model(...)) and compute shifted CE from logits (same as your AutoModel version).
+- For MLM (bidir-ish): DO NOT call the full model forward (it may enforce causal paths).
+  Instead, call the backbone directly (e.g., model.model) to get last_hidden_state,
+  then apply model's own lm_head / output embeddings to get logits, and compute MLM CE only on masked positions.
+- Robustly toggle attention behavior using:
+    * forward kw: is_causal=True/False (if accepted by backbone)
+    * and robust override: module.is_causal=True/False (FlashAttention2 sometimes consults this)
+- Keeps important training diagnostics:
+  grad_norm, grad_norm_rms, update_to_weight, grad_sim (+ norms), JSONL/CSV logging
 """
 
 import os
@@ -24,23 +24,20 @@ import argparse
 import inspect
 import json
 import csv
-from dataclasses import dataclass
-from typing import Optional, Iterator, List, Dict, Tuple, Any, Literal
+from typing import Optional, Iterator, List, Dict, Tuple
 from contextlib import contextmanager
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
-    AutoModel,
+    AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
     TrainerCallback,
 )
-from transformers.modeling_outputs import CausalLMOutput
 
 
 # -------------------------- is_causal robustness --------------------------
@@ -86,103 +83,51 @@ def _forward_accepts_param(model, name: str) -> bool:
         return True
 
 
-# -------------------------- Base model + LM head wrapper --------------------------
-class AutoModelWithLMHead(nn.Module):
+def _unwrap_model(model):
+    return getattr(model, "module", model)
+
+
+def get_backbone_from_causallm(model: torch.nn.Module) -> torch.nn.Module:
     """
-    AutoModel (base) の last_hidden_state から logits を作るための LM head を追加。
-    LM head は input embedding と weight tie する（decoder-only の標準）。
+    For most HF causalLM classes:
+      - model.model is the backbone (e.g., Qwen3ForCausalLM.model -> Qwen3Model)
+      - some use base_model / transformer / gpt_neox, etc.
+    We prefer .model if it exists and is nn.Module.
     """
-    def __init__(self, base: nn.Module):
-        super().__init__()
-        self.base = base
+    m = _unwrap_model(model)
+    # common: .model
+    if hasattr(m, "model") and isinstance(getattr(m, "model"), torch.nn.Module):
+        return getattr(m, "model")
+    # fallback: base_model
+    if hasattr(m, "base_model") and isinstance(getattr(m, "base_model"), torch.nn.Module):
+        return getattr(m, "base_model")
+    # fallback: transformer
+    if hasattr(m, "transformer") and isinstance(getattr(m, "transformer"), torch.nn.Module):
+        return getattr(m, "transformer")
+    # last resort: itself
+    return m
 
-        hidden = getattr(self.base.config, "hidden_size", None)
-        if hidden is None:
-            raise RuntimeError("base.config.hidden_size が取れません。")
 
-        vocab = getattr(self.base.config, "vocab_size", None)
-        if vocab is None:
-            emb = self.base.get_input_embeddings()
-            vocab = int(emb.weight.shape[0])
-
-        self.lm_head = nn.Linear(int(hidden), int(vocab), bias=False)
-        self.tie_weights()
-
-        self._accepts_is_causal = _forward_accepts_param(self.base, "is_causal")
-
-    @property
-    def config(self):
-        return self.base.config
-
-    def get_input_embeddings(self):
-        return self.base.get_input_embeddings()
-
-    def resize_token_embeddings(self, new_num_tokens: int):
-        out = self.base.resize_token_embeddings(new_num_tokens)
-        hidden = int(self.lm_head.in_features)
-        self.lm_head = nn.Linear(hidden, int(new_num_tokens), bias=False).to(self.lm_head.weight.device)
-        self.tie_weights()
-        return out
-
-    def tie_weights(self):
-        emb = self.base.get_input_embeddings()
-        self.lm_head.weight = emb.weight
-
-    def gradient_checkpointing_enable(self, **kwargs):
-        fn = getattr(self.base, "gradient_checkpointing_enable", None)
-        if callable(fn):
-            return fn(**kwargs)
-
-    def gradient_checkpointing_disable(self):
-        fn = getattr(self.base, "gradient_checkpointing_disable", None)
-        if callable(fn):
-            return fn()
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        *,
-        is_causal: Optional[bool] = None,
-        use_cache: bool = False,
-        output_hidden_states: bool = False,
-        return_dict: bool = True,
-    ):
-        base_kwargs = dict(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=use_cache,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-        )
-
-        if is_causal is not None and self._accepts_is_causal:
-            try:
-                out = self.base(**base_kwargs, is_causal=bool(is_causal))
-            except TypeError:
-                out = self.base(**base_kwargs)
-        else:
-            out = self.base(**base_kwargs)
-
-        hidden = out.last_hidden_state
-        logits = self.lm_head(hidden)
-
-        if not return_dict:
-            return (logits, out)
-
-        return CausalLMOutput(
-            loss=None,
-            logits=logits,
-            hidden_states=out.hidden_states if output_hidden_states else None,
-            attentions=out.attentions if hasattr(out, "attentions") else None,
-        )
+def get_lm_head_module(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Use HF's official output embeddings if possible.
+    """
+    m = _unwrap_model(model)
+    fn = getattr(m, "get_output_embeddings", None)
+    if callable(fn):
+        head = fn()
+        if head is not None:
+            return head
+    if hasattr(m, "lm_head") and isinstance(getattr(m, "lm_head"), torch.nn.Module):
+        return getattr(m, "lm_head")
+    raise RuntimeError("Could not find lm_head / output embeddings on this model.")
 
 
 # -------------------------- Tokenizer / mask token setup --------------------------
-def ensure_mask_token(tokenizer, model: AutoModelWithLMHead, mask_token: str = "<mask>") -> int:
+def ensure_mask_token(tokenizer, model, mask_token: str = "<mask>") -> int:
     """
     tokenizer に <mask> を追加して mask_token_id を確保。
-    AutoModelWithLMHead なので resize_token_embeddings 後に tie を張り直す。
+    AutoModelForCausalLM 側の resize + tie を利用。
     """
     mask_id = getattr(tokenizer, "mask_token_id", None)
     if mask_id is None:
@@ -190,7 +135,11 @@ def ensure_mask_token(tokenizer, model: AutoModelWithLMHead, mask_token: str = "
         mask_id = tokenizer.mask_token_id
         if num_added > 0:
             model.resize_token_embeddings(len(tokenizer))
-            model.tie_weights()
+            if hasattr(model, "tie_weights"):
+                try:
+                    model.tie_weights()
+                except Exception:
+                    pass
     if mask_id is None:
         raise RuntimeError("mask_token_id を確保できませんでした。")
     return int(mask_id)
@@ -315,24 +264,16 @@ def choose_mlm_positions_random(
 
 
 # -------------------------- Norm helpers (per-GPU; no allreduce) --------------------------
-def _unwrap_model(model):
-    return getattr(model, "module", model)
-
-
 def local_grad_sumsq_and_numel(model) -> Tuple[float, int]:
-    """
-    per-GPU: sum(g^2) と要素数 numel を返す
-    """
     m = _unwrap_model(model)
     sumsq = 0.0
     numel = 0
     for p in m.parameters():
         if p.grad is None:
             continue
-        g = p.grad.detach()
-        gf = g.float()
-        sumsq += float((gf * gf).sum().item())
-        numel += int(gf.numel())
+        g = p.grad.detach().float()
+        sumsq += float((g * g).sum().item())
+        numel += int(g.numel())
     return sumsq, numel
 
 
@@ -417,10 +358,10 @@ class JsonlCsvLoggerCallback(TrainerCallback):
 # -------------------------- Trainer --------------------------
 class CLMMLMTrainer(Trainer):
     """
-    - CLM: is_causal=True で forward、shifted CE を自前で計算
-    - MLM: is_causal=False で forward、<mask> 位置だけ CE
-    - both/alternate 対応
-    - grad_sim: grad(loss_clm) と grad(loss_mlm) の cosine similarity（log step のみ）
+    - CLM: full model forward -> logits -> shifted CE (manual)
+    - MLM: backbone forward (avoid causalLM wrapper) -> last_hidden_state -> lm_head -> masked CE
+    - both/alternate supported
+    - grad_sim: cosine similarity between grad(loss_clm) and grad(loss_mlm) (log step only)
     """
     def __init__(
         self,
@@ -450,6 +391,11 @@ class CLMMLMTrainer(Trainer):
 
         self.grad_sim_enabled = bool(grad_sim)
         self._can_grad_sim = (self.mask_policy == "both")
+
+        # ---- backbone + lm_head handle ----
+        self.backbone = get_backbone_from_causallm(self.model)
+        self.lm_head = get_lm_head_module(self.model)
+        self._backbone_accepts_is_causal = _forward_accepts_param(self.backbone, "is_causal")
 
         # RNG（GPU上でMLMマスク生成）
         dev = next(self.model.parameters()).device
@@ -511,7 +457,6 @@ class CLMMLMTrainer(Trainer):
         labels_s = input_ids[:, 1:].contiguous()
         am_s = attention_mask[:, 1:].contiguous().to(torch.bool)
         V = logits_s.size(-1)
-
         if am_s.any():
             loss = F.cross_entropy(
                 logits_s[am_s].view(-1, V),
@@ -531,6 +476,24 @@ class CLMMLMTrainer(Trainer):
                 return float("nan")
             return float(opt.param_groups[0].get("lr", float("nan")))
 
+    def _backbone_forward(self, input_ids, attention_mask, is_causal: Optional[bool]):
+        """
+        Call backbone forward. Pass is_causal if accepted; otherwise rely on module.is_causal override.
+        """
+        kwargs = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+            output_hidden_states=False,
+        )
+        if is_causal is not None and self._backbone_accepts_is_causal:
+            try:
+                return self.backbone(**kwargs, is_causal=bool(is_causal))
+            except TypeError:
+                return self.backbone(**kwargs)
+        return self.backbone(**kwargs)
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         mode = self._mode_now()
         input_ids = inputs["input_ids"]
@@ -539,13 +502,12 @@ class CLMMLMTrainer(Trainer):
         passes = 2 if mode == "both" else 1
 
         def run_clm():
-            with force_module_is_causal(model, True):
-                out = model(
+            # CLM: full model forward is fine (causal is natural), but we still force backbone.is_causal=True for safety.
+            with force_module_is_causal(self.backbone, True):
+                out = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    is_causal=True,
                     use_cache=False,
-                    output_hidden_states=False,
                     return_dict=True,
                 )
             loss = self._clm_loss_from_logits(out.logits, input_ids, attention_mask)
@@ -554,16 +516,12 @@ class CLMMLMTrainer(Trainer):
 
         def run_mlm():
             x_mlm, y_mlm, nmask = self._build_mlm_batch(inputs)
-            with force_module_is_causal(model, False):
-                out = model(
-                    input_ids=x_mlm,
-                    attention_mask=attention_mask,
-                    is_causal=False,
-                    use_cache=False,
-                    output_hidden_states=False,
-                    return_dict=True,
-                )
-            return self._mlm_loss_from_logits(out.logits, y_mlm), nmask
+            # MLM: call BACKBONE directly to avoid causalLM wrapper behavior.
+            with force_module_is_causal(self.backbone, False):
+                bo = self._backbone_forward(x_mlm, attention_mask, is_causal=False)
+            hidden = bo.last_hidden_state
+            logits = self.lm_head(hidden)
+            return self._mlm_loss_from_logits(logits, y_mlm), nmask
 
         loss_clm = None
         loss_mlm = None
@@ -610,34 +568,26 @@ class CLMMLMTrainer(Trainer):
         params = [p for p in self.model.parameters() if p.requires_grad]
 
         try:
-            # 1) CLM forward
             with self.compute_loss_context_manager():
                 input_ids = inputs["input_ids"]
                 attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
 
-                with force_module_is_causal(self.model, True):
+                # CLM (full model)
+                with force_module_is_causal(self.backbone, True):
                     o_clm = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        is_causal=True,
                         use_cache=False,
-                        output_hidden_states=False,
                         return_dict=True,
                     )
                 loss_clm = self._clm_loss_from_logits(o_clm.logits, input_ids, attention_mask)
 
-                # 2) MLM forward（同じ inputs から masked を作る）
+                # MLM (backbone + lm_head)
                 x_mlm, y_mlm, _ = self._build_mlm_batch(inputs)
-                with force_module_is_causal(self.model, False):
-                    o_mlm = self.model(
-                        input_ids=x_mlm,
-                        attention_mask=attention_mask,
-                        is_causal=False,
-                        use_cache=False,
-                        output_hidden_states=False,
-                        return_dict=True,
-                    )
-                loss_mlm = self._mlm_loss_from_logits(o_mlm.logits, y_mlm)
+                with force_module_is_causal(self.backbone, False):
+                    bo = self._backbone_forward(x_mlm, attention_mask, is_causal=False)
+                logits_mlm = self.lm_head(bo.last_hidden_state)
+                loss_mlm = self._mlm_loss_from_logits(logits_mlm, y_mlm)
 
             grads_c = torch.autograd.grad(loss_clm, params, allow_unused=True)
             grads_m = torch.autograd.grad(loss_mlm, params, allow_unused=True)
@@ -645,7 +595,7 @@ class CLMMLMTrainer(Trainer):
             dot = torch.zeros((), device=device, dtype=torch.float64)
             na  = torch.zeros((), device=device, dtype=torch.float64)
             nb  = torch.zeros((), device=device, dtype=torch.float64)
-            den = torch.zeros((), device=device, dtype=torch.float64)  # numel sum (for RMS)
+            den = torch.zeros((), device=device, dtype=torch.float64)
 
             for gc, gm in zip(grads_c, grads_m):
                 if gc is None or gm is None:
@@ -894,14 +844,28 @@ def main():
     if args.attn_impl == "flash_attention_2" and dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError("flash_attention_2 は fp16/bf16 が必要です。（--bf16 True or --fp16 True）")
 
-    base = AutoModel.from_pretrained(
-        args.model_name_or_path,
-        attn_implementation=args.attn_impl,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-    )
-    model = AutoModelWithLMHead(base)
+    # Prefer new arg name dtype if available; fall back to torch_dtype.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            attn_implementation=args.attn_impl,
+            trust_remote_code=True,
+            dtype=dtype,
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            attn_implementation=args.attn_impl,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+        )
+
     model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable") and args.gradient_checkpointing:
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:
+            pass
 
     # need MLM?
     alias = {"causal": "clm", "bidir": "mlm"}
@@ -985,6 +949,7 @@ def main():
     trainer.add_callback(JsonlCsvLoggerCallback(jsonl_path=args.log_jsonl, csv_path=args.log_csv))
 
     if trainer.is_world_process_zero():
+        backbone = get_backbone_from_causallm(model)
         print({
             "vocab_size": len(tok),
             "mask_token": getattr(tok, "mask_token", None),
@@ -993,7 +958,8 @@ def main():
             "dtype": str(dtype),
             "mask_policy": args.mask_policy,
             "grad_sim": bool(args.grad_sim),
-            "forward_accepts_is_causal": bool(model._accepts_is_causal),
+            "backbone_type": str(type(backbone)),
+            "backbone_accepts_is_causal": bool(_forward_accepts_param(backbone, "is_causal")),
             "logging_steps": int(args.logging_steps),
             "deepspeed": args.deepspeed,
             "logging_dir": args.logging_dir,
