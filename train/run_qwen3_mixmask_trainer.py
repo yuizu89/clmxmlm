@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+CLM+MLM (dual-mask) training for decoder-only models using:
+- AutoModel (base) + tied LM head
+- is_causal switch (True=CLM, False=MLM/bidir)
+- robust module.is_causal override (FlashAttention2 path safety)
+
+Key points:
+- Works with --attn_impl flash_attention_2 as long as the base model honors is_causal/module.is_causal.
+- MLM loss is computed only on <mask> positions.
+- CLM loss is standard shifted CE.
+- Packed streaming dataset yields fixed-length chunks without padding.
+
+Tested assumptions:
+- Tokenizer has eos_token_id
+- Base model returns last_hidden_state
+"""
+
 import os
 import time
-import math
 import argparse
 import inspect
 import json
 import csv
 from dataclasses import dataclass
-from typing import Optional, Iterator, List, Dict, Tuple, Any
+from typing import Optional, Iterator, List, Dict, Tuple, Any, Literal
 from contextlib import contextmanager
 
 import torch
@@ -31,7 +47,8 @@ from transformers.modeling_outputs import CausalLMOutput
 @contextmanager
 def force_module_is_causal(model: torch.nn.Module, flag: bool):
     """
-    FlashAttention2 などが module.is_causal を参照する経路があるので保険で上書き。
+    Some attention backends (incl. FlashAttention2) consult module.is_causal.
+    Force it for every submodule that has it, then restore.
     """
     touched = []
     for m in model.modules():
@@ -54,7 +71,7 @@ def force_module_is_causal(model: torch.nn.Module, flag: bool):
 
 def _forward_accepts_param(model, name: str) -> bool:
     """
-    best-effort signature check:
+    Best-effort signature check:
     - forward に name がある or **kwargs がある => True
     """
     try:
@@ -72,26 +89,25 @@ def _forward_accepts_param(model, name: str) -> bool:
 # -------------------------- Base model + LM head wrapper --------------------------
 class AutoModelWithLMHead(nn.Module):
     """
-    AutoModel (base) の last_hidden_state から logits を作るための LM head を追加。
-    LM head は input embedding と weight tie する（decoder-only の標準）。
+    AutoModel (base) + tied LM head (weight tied to input embeddings).
     """
     def __init__(self, base: nn.Module):
         super().__init__()
         self.base = base
+
         hidden = getattr(self.base.config, "hidden_size", None)
         if hidden is None:
             raise RuntimeError("base.config.hidden_size が取れません。")
 
+        # infer vocab
         vocab = getattr(self.base.config, "vocab_size", None)
         if vocab is None:
-            # 念のため embedding から推定
             emb = self.base.get_input_embeddings()
             vocab = int(emb.weight.shape[0])
 
         self.lm_head = nn.Linear(int(hidden), int(vocab), bias=False)
         self.tie_weights()
 
-        # is_causal kw を forward が受けるか（受けなくても module.is_causal で切替える）
         self._accepts_is_causal = _forward_accepts_param(self.base, "is_causal")
 
     @property
@@ -103,7 +119,6 @@ class AutoModelWithLMHead(nn.Module):
 
     def resize_token_embeddings(self, new_num_tokens: int):
         out = self.base.resize_token_embeddings(new_num_tokens)
-        # vocab が変わるので head を張り直し（Linear を作り直すのが安全）
         hidden = int(self.lm_head.in_features)
         self.lm_head = nn.Linear(hidden, int(new_num_tokens), bias=False).to(self.lm_head.weight.device)
         self.tie_weights()
@@ -111,10 +126,9 @@ class AutoModelWithLMHead(nn.Module):
 
     def tie_weights(self):
         emb = self.base.get_input_embeddings()
-        # weight tie
-        self.lm_head.weight = emb.weight
+        self.lm_head.weight = emb.weight  # tie
 
-    # Trainer の gradient_checkpointing サポートのための proxy
+    # gradient checkpointing proxy
     def gradient_checkpointing_enable(self, **kwargs):
         fn = getattr(self.base, "gradient_checkpointing_enable", None)
         if callable(fn):
@@ -143,7 +157,6 @@ class AutoModelWithLMHead(nn.Module):
             return_dict=True,
         )
 
-        # is_causal が forward で受理されるなら渡す（されない場合でも module.is_causal で切替済み想定）
         if is_causal is not None and self._accepts_is_causal:
             try:
                 out = self.base(**base_kwargs, is_causal=bool(is_causal))
@@ -162,15 +175,27 @@ class AutoModelWithLMHead(nn.Module):
             loss=None,
             logits=logits,
             hidden_states=out.hidden_states if output_hidden_states else None,
-            attentions=out.attentions if hasattr(out, "attentions") else None,
+            attentions=getattr(out, "attentions", None),
         )
 
 
-# -------------------------- Tokenizer / mask token setup --------------------------
+# -------------------------- Tokenizer helpers --------------------------
+def ensure_pad_token(tokenizer):
+    """
+    For safety. Packed dataset doesn't use padding, but some trainers/utilities may.
+    If pad_token is missing, set it to eos.
+    """
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        if getattr(tokenizer, "eos_token", None) is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            # last resort: add <pad>
+            tokenizer.add_special_tokens({"pad_token": "<pad>"})
+
+
 def ensure_mask_token(tokenizer, model: AutoModelWithLMHead, mask_token: str = "<mask>") -> int:
     """
     tokenizer に <mask> を追加して mask_token_id を確保。
-    AutoModelWithLMHead なので resize_token_embeddings 後に tie を張り直す。
     """
     mask_id = getattr(tokenizer, "mask_token_id", None)
     if mask_id is None:
@@ -258,18 +283,18 @@ class PackedStreamingIterable(IterableDataset):
 def clm_collate(examples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     input_ids = torch.stack([ex["input_ids"] for ex in examples], dim=0)  # (B,S)
     attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-    # labels は CLM でも MLM でも自前で作るので、ここでは input_ids だけで十分
     return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
 # -------------------------- MLM helpers --------------------------
 def special_ids_from_tokenizer(tok) -> List[int]:
     ids = []
-    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id", "mask_token_id"):
         v = getattr(tok, name, None)
         if v is not None:
             ids.append(int(v))
     return sorted(set(ids))
+
 
 def choose_mlm_positions_random(
     input_ids: torch.LongTensor,
@@ -277,6 +302,9 @@ def choose_mlm_positions_random(
     special_ids: List[int],
     rng: torch.Generator,
 ) -> torch.BoolTensor:
+    """
+    Random mask positions, excluding special tokens, ensure >=1 masked token per row.
+    """
     B, S = input_ids.shape
     device = input_ids.device
     if mask_ratio <= 0.0:
@@ -292,8 +320,9 @@ def choose_mlm_positions_random(
     # ensure >=1 per row
     any_row = sel.any(dim=1)
     if (~any_row).any():
-        bad = torch.where(~any_row)[0].tolist()
-        for b in bad:
+        bad = torch.where(~any_row)[0]
+        # choose first available candidate per bad row (deterministic-ish), else any position
+        for b in bad.tolist():
             idxs = torch.where(cand[b])[0]
             if idxs.numel() == 0:
                 idxs = torch.arange(S, device=device)
@@ -316,8 +345,8 @@ class JsonlCsvLoggerCallback(TrainerCallback):
         self.fields = fields or list(self.DEFAULT_FIELDS)
         self._csv_inited = False
 
-    def _is_process_zero(self, args, state) -> bool:
-        return getattr(state, "is_world_process_zero", True) if hasattr(state, "is_world_process_zero") else True
+    def _is_process_zero(self, state) -> bool:
+        return bool(getattr(state, "is_world_process_zero", True))
 
     def _ensure_parent(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -336,7 +365,7 @@ class JsonlCsvLoggerCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
             return
-        if not self._is_process_zero(args, state):
+        if not self._is_process_zero(state):
             return
 
         record = dict(logs)
@@ -356,9 +385,12 @@ class JsonlCsvLoggerCallback(TrainerCallback):
 
 
 # -------------------------- Trainer --------------------------
+MaskPolicy = Literal["clm", "mlm", "alternate", "both"]
+
+
 class CLMMLMTrainer(Trainer):
     """
-    - CLM: is_causal=True で forward、shifted CE を自前で計算
+    - CLM: is_causal=True で forward、shifted CE
     - MLM: is_causal=False で forward、<mask> 位置だけ CE
     """
     def __init__(
@@ -373,7 +405,7 @@ class CLMMLMTrainer(Trainer):
         super().__init__(*args, **kwargs)
 
         alias = {"causal": "clm", "bidir": "mlm"}
-        self.mask_policy = alias.get(mask_policy, mask_policy)
+        self.mask_policy: MaskPolicy = alias.get(mask_policy, mask_policy)  # type: ignore
         self.mlm_mask_ratio = float(mlm_mask_ratio)
 
         w = [float(x.strip()) for x in both_weights.split(",")]
@@ -386,7 +418,7 @@ class CLMMLMTrainer(Trainer):
         if need_mlm and self.mask_token_id is None:
             raise RuntimeError("MLMを使うには mask_token_id が必要です。")
 
-        # RNG（GPU上でMLMマスク生成）
+        # RNG (on same device as model)
         dev = next(self.model.parameters()).device
         self._rng = torch.Generator(device=dev)
         base_seed = int(getattr(self.args, "seed", 42))
@@ -410,9 +442,10 @@ class CLMMLMTrainer(Trainer):
         self._int_tokens_base = 0
         self._int_step_time = 0.0
 
-    def _mode_now(self) -> str:
+    def _mode_now(self) -> MaskPolicy:
         if self.mask_policy in ("clm", "mlm", "both"):
             return self.mask_policy
+        # alternate
         return "mlm" if (self.state.global_step % 2 == 1) else "clm"
 
     def _build_mlm_batch(self, inputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, int]:
@@ -439,24 +472,18 @@ class CLMMLMTrainer(Trainer):
         return F.cross_entropy(logits[mask].view(-1, V), labels[mask].view(-1), reduction="mean")
 
     def _clm_loss_from_logits(self, logits: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # logits: (B,S,V), input_ids: (B,S)
-        # shift: predict token t+1 from position t
         logits_s = logits[:, :-1, :].contiguous()
         labels_s = input_ids[:, 1:].contiguous()
-
-        # pad を無視（このコードの packed データは基本 pad 無いが安全策）
         am_s = attention_mask[:, 1:].contiguous().to(torch.bool)
         V = logits_s.size(-1)
 
         if am_s.any():
-            loss = F.cross_entropy(
+            return F.cross_entropy(
                 logits_s[am_s].view(-1, V),
                 labels_s[am_s].view(-1),
                 reduction="mean",
             )
-        else:
-            loss = logits.sum() * 0.0
-        return loss
+        return logits.sum() * 0.0
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         mode = self._mode_now()
@@ -476,7 +503,7 @@ class CLMMLMTrainer(Trainer):
                     return_dict=True,
                 )
             loss = self._clm_loss_from_logits(out.logits, input_ids, attention_mask)
-            active = int((attention_mask[:, 1:].sum()).item())
+            active = int(attention_mask[:, 1:].sum().item())
             return loss, active
 
         def run_mlm():
@@ -502,13 +529,13 @@ class CLMMLMTrainer(Trainer):
         elif mode == "mlm":
             loss_mlm, active = run_mlm()
             loss_total = loss_mlm
-        else:
+        else:  # both
             loss_clm, act_c = run_clm()
             loss_mlm, act_m = run_mlm()
             active = int(act_c + act_m)
             loss_total = self.w_clm * loss_clm + self.w_mlm * loss_mlm
 
-        # interval logging stats（NO super().log 直接呼び出し）
+        # interval stats for custom log()
         self._int_micro += 1
         self._int_loss += float(loss_total.detach().float().cpu())
 
@@ -522,7 +549,9 @@ class CLMMLMTrainer(Trainer):
         self._int_active_tokens += int(active)
         self._int_tokens_base += int(B * S * passes)
 
-        return (loss_total, None) if return_outputs else loss_total
+        if return_outputs:
+            return loss_total, {"loss_clm": loss_clm, "loss_mlm": loss_mlm}
+        return loss_total
 
     def _is_end_of_step(self) -> bool:
         if getattr(self, "accelerator", None) is not None:
@@ -549,7 +578,7 @@ class CLMMLMTrainer(Trainer):
         return loss
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None):
-        # eval_* はそのまま
+        # keep eval_* intact
         if any(k.startswith("eval_") for k in logs.keys()):
             try:
                 return super().log(logs, start_time=start_time)
@@ -565,7 +594,7 @@ class CLMMLMTrainer(Trainer):
 
         tps_active = float(self._int_active_tokens) / dt
 
-        # per-GPU TFLOPS estimate（world_size を掛けない）
+        # rough per-GPU TFLOPS estimate
         flops_est = 6.0 * float(self._n_params) * float(self._int_tokens_base)
         tflops = (flops_est / dt) / 1e12
 
@@ -600,9 +629,39 @@ class CLMMLMTrainer(Trainer):
             return super().log(out)
 
 
+# -------------------------- sanity check --------------------------
+@torch.no_grad()
+def sanity_check_is_causal_effect(model: AutoModelWithLMHead, device: torch.device):
+    """
+    Verify that is_causal toggling actually changes hidden/logits (i.e., bidir != causal).
+    """
+    model.eval()
+    B, S = 2, 32
+    x = torch.randint(low=0, high=int(model.config.vocab_size), size=(B, S), device=device, dtype=torch.long)
+    am = torch.ones((B, S), device=device, dtype=torch.long)
+
+    with force_module_is_causal(model, True):
+        out_c = model(input_ids=x, attention_mask=am, is_causal=True, use_cache=False, return_dict=True)
+    with force_module_is_causal(model, False):
+        out_b = model(input_ids=x, attention_mask=am, is_causal=False, use_cache=False, return_dict=True)
+
+    diff = (out_b.logits - out_c.logits).abs()
+    mx = float(diff.max().item())
+    # exclude last position (often least affected)
+    mx_excl_last = float(diff[:, :-1].max().item()) if diff.size(1) > 1 else mx
+    print(f"[sanity] max|bidir-causal| logits(all)={mx:.3e} logits(excl_last)={mx_excl_last:.3e}")
+    if mx_excl_last <= 1e-7:
+        raise RuntimeError(
+            "Sanity check failed: is_causal toggle seems ineffective (bidir identical to causal). "
+            "This usually means the backend/model is forcing causal masking."
+        )
+    model.train()
+
+
 # -------------------------- CLI / main --------------------------
 def _str2bool(x: str) -> bool:
     return str(x).lower() in ("1", "true", "yes", "y", "t")
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -615,7 +674,12 @@ def parse_args():
     p.add_argument("--dataset_config", type=str, default=None)
     p.add_argument("--dataset_split", type=str, default="train")
     p.add_argument("--text_column", type=str, default="text")
-    p.add_argument("--streaming", action="store_true", default=True)
+
+    # streaming toggle (default: True)
+    p.add_argument("--streaming", dest="streaming", action="store_true")
+    p.add_argument("--no_streaming", dest="streaming", action="store_false")
+    p.set_defaults(streaming=True)
+
     p.add_argument("--shuffle_buffer", type=int, default=10_000)
     p.add_argument("--seqlen", type=int, default=2048)
     p.add_argument("--cache_dir", type=str, default=None)
@@ -630,7 +694,7 @@ def parse_args():
 
     p.add_argument("--output_dir", type=str, default="ckpt_out")
 
-    # ---- logging outputs ----
+    # logging outputs
     p.add_argument("--logging_dir", type=str, default=None)
     p.add_argument("--report_to", type=str, default="none")
     p.add_argument("--log_jsonl", type=str, default=None)
@@ -646,6 +710,7 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=500)
     p.add_argument("--save_total_limit", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
+
     p.add_argument("--bf16", type=_str2bool, default=True)
     p.add_argument("--fp16", type=_str2bool, default=False)
     p.add_argument("--gradient_checkpointing", action="store_true")
@@ -653,7 +718,11 @@ def parse_args():
 
     p.add_argument("--deepspeed", type=str, default=None)
 
+    # extra robustness
+    p.add_argument("--sanity_check", type=_str2bool, default=True)
+
     return p.parse_args()
+
 
 def main():
     args = parse_args()
@@ -666,19 +735,30 @@ def main():
         args.log_csv = os.path.join(args.output_dir, "train_log.csv")
 
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True, trust_remote_code=True)
+    ensure_pad_token(tok)
 
-    dtype = torch.bfloat16 if args.bf16 and torch.cuda.is_available() else (
-        torch.float16 if args.fp16 and torch.cuda.is_available() else torch.float32
-    )
+    # dtype (prefer bf16 on CUDA)
+    use_cuda = torch.cuda.is_available()
+    dtype = torch.bfloat16 if (args.bf16 and use_cuda) else (torch.float16 if (args.fp16 and use_cuda) else torch.float32)
 
-    base = AutoModel.from_pretrained(
-        args.model_name_or_path,
+    # IMPORTANT: newer transformers warn torch_dtype deprecated -> prefer dtype
+    model_kwargs = dict(
         attn_implementation=args.attn_impl,
         trust_remote_code=True,
-        torch_dtype=dtype,
+        use_cache=False,
     )
+    try:
+        base = AutoModel.from_pretrained(args.model_name_or_path, dtype=dtype, **model_kwargs)
+    except TypeError:
+        base = AutoModel.from_pretrained(args.model_name_or_path, torch_dtype=dtype, **model_kwargs)
+
     model = AutoModelWithLMHead(base)
-    model.config.use_cache = False  # 強制的に off
+    model.config.use_cache = False  # force off
+
+    # If we added pad_token, embeddings may need resize
+    if len(tok) != int(model.config.vocab_size):
+        model.resize_token_embeddings(len(tok))
+        model.tie_weights()
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -695,6 +775,10 @@ def main():
             mask_id = getattr(tok, "mask_token_id", None)
             if mask_id is None:
                 raise RuntimeError("mask_token_id がありません。--ensure_mask_token True を使ってください。")
+
+    # optional sanity check (ensure is_causal toggling is effective)
+    if args.sanity_check and use_cuda:
+        sanity_check_is_causal_effect(model, device=torch.device("cuda"))
 
     train_ds = PackedStreamingIterable(
         tokenizer=tok,
@@ -731,13 +815,14 @@ def main():
         fp16=args.fp16,
         gradient_checkpointing=args.gradient_checkpointing,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
+        remove_unused_columns=False,  # keep attention_mask etc. stable
     )
     if args.deepspeed:
         targs_kwargs["deepspeed"] = args.deepspeed
 
     targs = TrainingArguments(**targs_kwargs)
 
-    # tokenizer deprecation 回避（transformers のバージョン差を吸収）
+    # tokenizer deprecation avoidance (transformers version differences)
     trainer_init_sig = inspect.signature(Trainer.__init__)
     trainer_tokenizer_kw = {}
     if "processing_class" in trainer_init_sig.parameters:
@@ -762,16 +847,23 @@ def main():
     if trainer.is_world_process_zero():
         print({
             "vocab_size": len(tok),
+            "pad_token": getattr(tok, "pad_token", None),
+            "pad_token_id": getattr(tok, "pad_token_id", None),
             "mask_token": getattr(tok, "mask_token", None),
             "mask_token_id": getattr(tok, "mask_token_id", None),
             "attn_impl": args.attn_impl,
             "mask_policy": args.mask_policy,
+            "mlm_mask_ratio": float(args.mlm_mask_ratio),
+            "both_weights": args.both_weights,
+            "seqlen": int(args.seqlen),
+            "streaming": bool(args.streaming),
             "logging_steps": int(args.logging_steps),
             "deepspeed": args.deepspeed,
             "logging_dir": args.logging_dir,
             "report_to": args.report_to,
             "log_jsonl": args.log_jsonl,
             "log_csv": args.log_csv,
+            "sanity_check": bool(args.sanity_check),
         })
 
     trainer.train()
@@ -779,6 +871,7 @@ def main():
     if trainer.is_world_process_zero():
         trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
+
 
 if __name__ == "__main__":
     main()
