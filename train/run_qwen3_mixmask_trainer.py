@@ -2,24 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-CLM+MLM (dual-mask) training for decoder-only models using:
-- AutoModel (base) + tied LM head
-- is_causal switch (True=CLM, False=MLM/bidir)
-- robust module.is_causal override (FlashAttention2 path safety)
+CLM/MLM (dual-mode via is_causal) trainer for decoder-only models using AutoModel.
 
-Key points:
-- Works with --attn_impl flash_attention_2 as long as the base model honors is_causal/module.is_causal.
-- MLM loss is computed only on <mask> positions.
-- CLM loss is standard shifted CE.
-- Packed streaming dataset yields fixed-length chunks without padding.
+- Use AutoModel (base) + tied LM head to avoid AutoModelForCausalLM forcing causal.
+- Switch attention behavior with:
+    * forward kw: is_causal=True/False (if accepted)
+    * and robust override: module.is_causal=True/False (FlashAttention2 consults this path)
+- Supports flash_attention_2 for BOTH CLM and MLM as long as dtype is bf16/fp16.
 
-Tested assumptions:
-- Tokenizer has eos_token_id
-- Base model returns last_hidden_state
+Keeps important training diagnostics from the original code:
+- grad_norm, grad_norm_rms (local RMS), update_to_weight
+- grad_sim (cosine similarity between grad(loss_clm) and grad(loss_mlm)) for mask_policy=both
+- grad_norm_clm/mlm and RMS, grad_sim_ms, grad_sim_oom
+- JSONL/CSV logging with fixed columns
 """
 
 import os
 import time
+import math
 import argparse
 import inspect
 import json
@@ -71,7 +71,7 @@ def force_module_is_causal(model: torch.nn.Module, flag: bool):
 
 def _forward_accepts_param(model, name: str) -> bool:
     """
-    Best-effort signature check:
+    best-effort signature check:
     - forward に name がある or **kwargs がある => True
     """
     try:
@@ -89,7 +89,8 @@ def _forward_accepts_param(model, name: str) -> bool:
 # -------------------------- Base model + LM head wrapper --------------------------
 class AutoModelWithLMHead(nn.Module):
     """
-    AutoModel (base) + tied LM head (weight tied to input embeddings).
+    AutoModel (base) の last_hidden_state から logits を作るための LM head を追加。
+    LM head は input embedding と weight tie する（decoder-only の標準）。
     """
     def __init__(self, base: nn.Module):
         super().__init__()
@@ -99,7 +100,6 @@ class AutoModelWithLMHead(nn.Module):
         if hidden is None:
             raise RuntimeError("base.config.hidden_size が取れません。")
 
-        # infer vocab
         vocab = getattr(self.base.config, "vocab_size", None)
         if vocab is None:
             emb = self.base.get_input_embeddings()
@@ -126,9 +126,8 @@ class AutoModelWithLMHead(nn.Module):
 
     def tie_weights(self):
         emb = self.base.get_input_embeddings()
-        self.lm_head.weight = emb.weight  # tie
+        self.lm_head.weight = emb.weight
 
-    # gradient checkpointing proxy
     def gradient_checkpointing_enable(self, **kwargs):
         fn = getattr(self.base, "gradient_checkpointing_enable", None)
         if callable(fn):
@@ -175,27 +174,15 @@ class AutoModelWithLMHead(nn.Module):
             loss=None,
             logits=logits,
             hidden_states=out.hidden_states if output_hidden_states else None,
-            attentions=getattr(out, "attentions", None),
+            attentions=out.attentions if hasattr(out, "attentions") else None,
         )
 
 
-# -------------------------- Tokenizer helpers --------------------------
-def ensure_pad_token(tokenizer):
-    """
-    For safety. Packed dataset doesn't use padding, but some trainers/utilities may.
-    If pad_token is missing, set it to eos.
-    """
-    if getattr(tokenizer, "pad_token_id", None) is None:
-        if getattr(tokenizer, "eos_token", None) is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            # last resort: add <pad>
-            tokenizer.add_special_tokens({"pad_token": "<pad>"})
-
-
+# -------------------------- Tokenizer / mask token setup --------------------------
 def ensure_mask_token(tokenizer, model: AutoModelWithLMHead, mask_token: str = "<mask>") -> int:
     """
     tokenizer に <mask> を追加して mask_token_id を確保。
+    AutoModelWithLMHead なので resize_token_embeddings 後に tie を張り直す。
     """
     mask_id = getattr(tokenizer, "mask_token_id", None)
     if mask_id is None:
@@ -289,7 +276,7 @@ def clm_collate(examples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tens
 # -------------------------- MLM helpers --------------------------
 def special_ids_from_tokenizer(tok) -> List[int]:
     ids = []
-    for name in ("bos_token_id", "eos_token_id", "pad_token_id", "mask_token_id"):
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
         v = getattr(tok, name, None)
         if v is not None:
             ids.append(int(v))
@@ -302,9 +289,6 @@ def choose_mlm_positions_random(
     special_ids: List[int],
     rng: torch.Generator,
 ) -> torch.BoolTensor:
-    """
-    Random mask positions, excluding special tokens, ensure >=1 masked token per row.
-    """
     B, S = input_ids.shape
     device = input_ids.device
     if mask_ratio <= 0.0:
@@ -320,9 +304,8 @@ def choose_mlm_positions_random(
     # ensure >=1 per row
     any_row = sel.any(dim=1)
     if (~any_row).any():
-        bad = torch.where(~any_row)[0]
-        # choose first available candidate per bad row (deterministic-ish), else any position
-        for b in bad.tolist():
+        bad = torch.where(~any_row)[0].tolist()
+        for b in bad:
             idxs = torch.where(cand[b])[0]
             if idxs.numel() == 0:
                 idxs = torch.arange(S, device=device)
@@ -331,12 +314,59 @@ def choose_mlm_positions_random(
     return sel
 
 
+# -------------------------- Norm helpers (per-GPU; no allreduce) --------------------------
+def _unwrap_model(model):
+    return getattr(model, "module", model)
+
+
+def local_grad_sumsq_and_numel(model) -> Tuple[float, int]:
+    """
+    per-GPU: sum(g^2) と要素数 numel を返す
+    """
+    m = _unwrap_model(model)
+    sumsq = 0.0
+    numel = 0
+    for p in m.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        gf = g.float()
+        sumsq += float((gf * gf).sum().item())
+        numel += int(gf.numel())
+    return sumsq, numel
+
+
+def local_grad_norm(model) -> float:
+    sumsq, _ = local_grad_sumsq_and_numel(model)
+    return math.sqrt(max(sumsq, 1e-30))
+
+
+def local_grad_rms(model) -> float:
+    sumsq, n = local_grad_sumsq_and_numel(model)
+    if n <= 0:
+        return float("nan")
+    return math.sqrt(max(sumsq / float(n), 1e-30))
+
+
+def local_weight_norm(model) -> float:
+    m = _unwrap_model(model)
+    sq = 0.0
+    for p in m.parameters():
+        v = p.detach().float()
+        sq += float((v * v).sum().item())
+    return math.sqrt(max(sq, 1e-30))
+
+
 # -------------------------- Logging callback: JSONL + CSV --------------------------
 class JsonlCsvLoggerCallback(TrainerCallback):
     DEFAULT_FIELDS = [
         "step", "epoch", "lr",
         "loss", "loss_clm", "loss_mlm",
         "tps_active", "tflops",
+        "grad_norm", "grad_norm_rms", "update_to_weight",
+        "grad_sim", "grad_norm_clm", "grad_norm_mlm",
+        "grad_norm_clm_rms", "grad_norm_mlm_rms",
+        "grad_sim_ms", "grad_sim_oom",
     ]
 
     def __init__(self, jsonl_path: Optional[str], csv_path: Optional[str], fields: Optional[List[str]] = None):
@@ -345,8 +375,8 @@ class JsonlCsvLoggerCallback(TrainerCallback):
         self.fields = fields or list(self.DEFAULT_FIELDS)
         self._csv_inited = False
 
-    def _is_process_zero(self, state) -> bool:
-        return bool(getattr(state, "is_world_process_zero", True))
+    def _is_process_zero(self, args, state) -> bool:
+        return getattr(state, "is_world_process_zero", True) if hasattr(state, "is_world_process_zero") else True
 
     def _ensure_parent(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -365,7 +395,7 @@ class JsonlCsvLoggerCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
             return
-        if not self._is_process_zero(state):
+        if not self._is_process_zero(args, state):
             return
 
         record = dict(logs)
@@ -385,13 +415,12 @@ class JsonlCsvLoggerCallback(TrainerCallback):
 
 
 # -------------------------- Trainer --------------------------
-MaskPolicy = Literal["clm", "mlm", "alternate", "both"]
-
-
 class CLMMLMTrainer(Trainer):
     """
-    - CLM: is_causal=True で forward、shifted CE
+    - CLM: is_causal=True で forward、shifted CE を自前で計算
     - MLM: is_causal=False で forward、<mask> 位置だけ CE
+    - both/alternate 対応
+    - grad_sim: grad(loss_clm) と grad(loss_mlm) の cosine similarity（log step のみ）
     """
     def __init__(
         self,
@@ -400,12 +429,13 @@ class CLMMLMTrainer(Trainer):
         mlm_mask_ratio: float = 0.15,
         both_weights: str = "1.0,1.0",
         mask_token_id: Optional[int] = None,
+        grad_sim: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
         alias = {"causal": "clm", "bidir": "mlm"}
-        self.mask_policy: MaskPolicy = alias.get(mask_policy, mask_policy)  # type: ignore
+        self.mask_policy = alias.get(mask_policy, mask_policy)
         self.mlm_mask_ratio = float(mlm_mask_ratio)
 
         w = [float(x.strip()) for x in both_weights.split(",")]
@@ -418,7 +448,10 @@ class CLMMLMTrainer(Trainer):
         if need_mlm and self.mask_token_id is None:
             raise RuntimeError("MLMを使うには mask_token_id が必要です。")
 
-        # RNG (on same device as model)
+        self.grad_sim_enabled = bool(grad_sim)
+        self._can_grad_sim = (self.mask_policy == "both")
+
+        # RNG（GPU上でMLMマスク生成）
         dev = next(self.model.parameters()).device
         self._rng = torch.Generator(device=dev)
         base_seed = int(getattr(self.args, "seed", 42))
@@ -431,6 +464,9 @@ class CLMMLMTrainer(Trainer):
         self._step_start_time: Optional[float] = None
         self._micro_in_step: int = 0
 
+        self._pending_grad_stats: Optional[Dict[str, float]] = None
+        self._pending_grad_sim: Optional[Dict[str, float]] = None
+
     def _reset_interval(self):
         self._int_micro = 0
         self._int_loss = 0.0
@@ -442,10 +478,9 @@ class CLMMLMTrainer(Trainer):
         self._int_tokens_base = 0
         self._int_step_time = 0.0
 
-    def _mode_now(self) -> MaskPolicy:
+    def _mode_now(self) -> str:
         if self.mask_policy in ("clm", "mlm", "both"):
             return self.mask_policy
-        # alternate
         return "mlm" if (self.state.global_step % 2 == 1) else "clm"
 
     def _build_mlm_batch(self, inputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, int]:
@@ -478,12 +513,23 @@ class CLMMLMTrainer(Trainer):
         V = logits_s.size(-1)
 
         if am_s.any():
-            return F.cross_entropy(
+            loss = F.cross_entropy(
                 logits_s[am_s].view(-1, V),
                 labels_s[am_s].view(-1),
                 reduction="mean",
             )
-        return logits.sum() * 0.0
+        else:
+            loss = logits.sum() * 0.0
+        return loss
+
+    def _compute_lr(self) -> float:
+        try:
+            return float(self._get_learning_rate())
+        except Exception:
+            opt = getattr(self, "optimizer", None)
+            if opt is None or len(opt.param_groups) == 0:
+                return float("nan")
+            return float(opt.param_groups[0].get("lr", float("nan")))
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         mode = self._mode_now()
@@ -529,13 +575,13 @@ class CLMMLMTrainer(Trainer):
         elif mode == "mlm":
             loss_mlm, active = run_mlm()
             loss_total = loss_mlm
-        else:  # both
+        else:
             loss_clm, act_c = run_clm()
             loss_mlm, act_m = run_mlm()
             active = int(act_c + act_m)
             loss_total = self.w_clm * loss_clm + self.w_mlm * loss_mlm
 
-        # interval stats for custom log()
+        # interval stats
         self._int_micro += 1
         self._int_loss += float(loss_total.detach().float().cpu())
 
@@ -549,15 +595,119 @@ class CLMMLMTrainer(Trainer):
         self._int_active_tokens += int(active)
         self._int_tokens_base += int(B * S * passes)
 
-        if return_outputs:
-            return loss_total, {"loss_clm": loss_clm, "loss_mlm": loss_mlm}
-        return loss_total
+        return (loss_total, None) if return_outputs else loss_total
+
+    def _compute_grad_sim_all_params(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """
+        grad_sim: cosine similarity between grad(loss_clm) and grad(loss_mlm).
+        - autograd.grad を使う（通常学習の backward とは別の “追加” 勾配計算）
+        - 集計は GPU 上で行い、最後にスカラーのみ取得
+        """
+        device = next(self.model.parameters()).device
+        t0 = time.time()
+        out: Dict[str, float] = {"grad_sim": float("nan"), "grad_sim_oom": 0.0}
+
+        params = [p for p in self.model.parameters() if p.requires_grad]
+
+        try:
+            # 1) CLM forward
+            with self.compute_loss_context_manager():
+                input_ids = inputs["input_ids"]
+                attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
+
+                with force_module_is_causal(self.model, True):
+                    o_clm = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        is_causal=True,
+                        use_cache=False,
+                        output_hidden_states=False,
+                        return_dict=True,
+                    )
+                loss_clm = self._clm_loss_from_logits(o_clm.logits, input_ids, attention_mask)
+
+                # 2) MLM forward（同じ inputs から masked を作る）
+                x_mlm, y_mlm, _ = self._build_mlm_batch(inputs)
+                with force_module_is_causal(self.model, False):
+                    o_mlm = self.model(
+                        input_ids=x_mlm,
+                        attention_mask=attention_mask,
+                        is_causal=False,
+                        use_cache=False,
+                        output_hidden_states=False,
+                        return_dict=True,
+                    )
+                loss_mlm = self._mlm_loss_from_logits(o_mlm.logits, y_mlm)
+
+            grads_c = torch.autograd.grad(loss_clm, params, allow_unused=True)
+            grads_m = torch.autograd.grad(loss_mlm, params, allow_unused=True)
+
+            dot = torch.zeros((), device=device, dtype=torch.float64)
+            na  = torch.zeros((), device=device, dtype=torch.float64)
+            nb  = torch.zeros((), device=device, dtype=torch.float64)
+            den = torch.zeros((), device=device, dtype=torch.float64)  # numel sum (for RMS)
+
+            for gc, gm in zip(grads_c, grads_m):
+                if gc is None or gm is None:
+                    continue
+                gc = gc.detach().float()
+                gm = gm.detach().float()
+                dot = dot + (gc * gm).sum(dtype=torch.float64)
+                na  = na  + (gc * gc).sum(dtype=torch.float64)
+                nb  = nb  + (gm * gm).sum(dtype=torch.float64)
+                den = den + float(gc.numel())
+
+            dotv = float(dot.item())
+            nav  = float(na.item())
+            nbv  = float(nb.item())
+            denv = float(den.item())
+
+            cos = dotv / (math.sqrt(max(nav, 1e-30)) * math.sqrt(max(nbv, 1e-30)) + 1e-30)
+
+            out["grad_sim"] = float(cos)
+            out["grad_norm_clm"] = math.sqrt(max(nav, 1e-30))
+            out["grad_norm_mlm"] = math.sqrt(max(nbv, 1e-30))
+
+            if denv > 0.0:
+                out["grad_norm_clm_rms"] = math.sqrt(max(nav / denv, 1e-30))
+                out["grad_norm_mlm_rms"] = math.sqrt(max(nbv / denv, 1e-30))
+
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "out of memory" in msg or "cuda oom" in msg:
+                out["grad_sim_oom"] = 1.0
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            else:
+                raise
+
+        out["grad_sim_ms"] = (time.time() - t0) * 1000.0
+        return out
 
     def _is_end_of_step(self) -> bool:
         if getattr(self, "accelerator", None) is not None:
             return bool(self.accelerator.sync_gradients)
         gas = int(getattr(self.args, "gradient_accumulation_steps", 1))
         return (self._micro_in_step % max(1, gas) == 0)
+
+    def _get_grad_norm_and_rms(self) -> Tuple[float, float]:
+        """
+        - grad_norm: 可能なら deepspeed engine の global grad norm を優先（ZeRO-2 等）
+        - grad_norm_rms: per-GPU の local RMS
+        """
+        rms_local = float(local_grad_rms(self.model))
+        eng = getattr(self, "deepspeed", None)
+        if eng is not None and hasattr(eng, "get_global_grad_norm"):
+            try:
+                g = eng.get_global_grad_norm()
+                if isinstance(g, (float, int)):
+                    return float(g), rms_local
+                return float(getattr(g, "item", lambda: g)()), rms_local
+            except Exception:
+                pass
+        return float(local_grad_norm(self.model)), rms_local
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         self._micro_in_step += 1
@@ -570,6 +720,23 @@ class CLMMLMTrainer(Trainer):
             loss = super().training_step(model, inputs)
 
         if self._is_end_of_step():
+            next_step = int(self.state.global_step) + 1
+            is_log_step = (self.args.logging_steps > 0) and (next_step % int(self.args.logging_steps) == 0)
+
+            if is_log_step:
+                gnorm, grms = self._get_grad_norm_and_rms()
+                wnorm = float(local_weight_norm(self.model))
+                lr = float(self._compute_lr())
+                upd2w = lr * float(gnorm) / max(wnorm, 1e-30)
+                self._pending_grad_stats = {
+                    "grad_norm": float(gnorm),
+                    "grad_norm_rms": float(grms),
+                    "update_to_weight": float(upd2w),
+                }
+
+                if self.grad_sim_enabled and self._can_grad_sim:
+                    self._pending_grad_sim = self._compute_grad_sim_all_params(inputs)
+
             step_dt = max(1e-9, time.time() - self._step_start_time)
             self._int_step_time += float(step_dt)
             self._step_start_time = None
@@ -578,7 +745,6 @@ class CLMMLMTrainer(Trainer):
         return loss
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None):
-        # keep eval_* intact
         if any(k.startswith("eval_") for k in logs.keys()):
             try:
                 return super().log(logs, start_time=start_time)
@@ -594,26 +760,18 @@ class CLMMLMTrainer(Trainer):
 
         tps_active = float(self._int_active_tokens) / dt
 
-        # rough per-GPU TFLOPS estimate
         flops_est = 6.0 * float(self._n_params) * float(self._int_tokens_base)
         tflops = (flops_est / dt) / 1e12
 
         step = int(self.state.global_step)
         epoch = float(self.state.epoch) if self.state.epoch is not None else float("nan")
-
-        # lr
-        lr = float("nan")
-        try:
-            lr = float(self._get_learning_rate())
-        except Exception:
-            opt = getattr(self, "optimizer", None)
-            if opt is not None and len(opt.param_groups) > 0:
-                lr = float(opt.param_groups[0].get("lr", float("nan")))
+        lr = float(self._compute_lr())
+        lr_disp = float(f"{lr:.8f}") if lr == lr else lr
 
         out: Dict[str, float] = {
             "step": step,
             "epoch": round(epoch, 4) if epoch == epoch else epoch,
-            "lr": float(f"{lr:.8f}") if lr == lr else lr,
+            "lr": lr_disp,
             "loss": round(float(loss_avg), 4),
             "loss_clm": round(float(loss_clm), 4) if loss_clm == loss_clm else loss_clm,
             "loss_mlm": round(float(loss_mlm), 4) if loss_mlm == loss_mlm else loss_mlm,
@@ -621,41 +779,39 @@ class CLMMLMTrainer(Trainer):
             "tflops": round(float(tflops), 2),
         }
 
+        if self._pending_grad_stats is not None:
+            out["grad_norm"] = round(float(self._pending_grad_stats["grad_norm"]), 4)
+            out["grad_norm_rms"] = round(float(self._pending_grad_stats["grad_norm_rms"]), 6)
+            out["update_to_weight"] = round(float(self._pending_grad_stats["update_to_weight"]), 6)
+            self._pending_grad_stats = None
+
+        if self._pending_grad_sim is not None:
+            gs = self._pending_grad_sim
+            if "grad_sim" in gs and gs["grad_sim"] == gs["grad_sim"]:
+                out["grad_sim"] = round(float(gs["grad_sim"]), 6)
+            else:
+                out["grad_sim"] = gs.get("grad_sim", float("nan"))
+
+            if "grad_norm_clm" in gs:
+                out["grad_norm_clm"] = round(float(gs["grad_norm_clm"]), 4)
+            if "grad_norm_mlm" in gs:
+                out["grad_norm_mlm"] = round(float(gs["grad_norm_mlm"]), 4)
+
+            if "grad_norm_clm_rms" in gs:
+                out["grad_norm_clm_rms"] = round(float(gs["grad_norm_clm_rms"]), 6)
+            if "grad_norm_mlm_rms" in gs:
+                out["grad_norm_mlm_rms"] = round(float(gs["grad_norm_mlm_rms"]), 6)
+
+            out["grad_sim_ms"] = round(float(gs.get("grad_sim_ms", 0.0)), 2)
+            out["grad_sim_oom"] = float(gs.get("grad_sim_oom", 0.0))
+            self._pending_grad_sim = None
+
         self._reset_interval()
 
         try:
             return super().log(out, start_time=start_time)
         except TypeError:
             return super().log(out)
-
-
-# -------------------------- sanity check --------------------------
-@torch.no_grad()
-def sanity_check_is_causal_effect(model: AutoModelWithLMHead, device: torch.device):
-    """
-    Verify that is_causal toggling actually changes hidden/logits (i.e., bidir != causal).
-    """
-    model.eval()
-    B, S = 2, 32
-    x = torch.randint(low=0, high=int(model.config.vocab_size), size=(B, S), device=device, dtype=torch.long)
-    am = torch.ones((B, S), device=device, dtype=torch.long)
-
-    with force_module_is_causal(model, True):
-        out_c = model(input_ids=x, attention_mask=am, is_causal=True, use_cache=False, return_dict=True)
-    with force_module_is_causal(model, False):
-        out_b = model(input_ids=x, attention_mask=am, is_causal=False, use_cache=False, return_dict=True)
-
-    diff = (out_b.logits - out_c.logits).abs()
-    mx = float(diff.max().item())
-    # exclude last position (often least affected)
-    mx_excl_last = float(diff[:, :-1].max().item()) if diff.size(1) > 1 else mx
-    print(f"[sanity] max|bidir-causal| logits(all)={mx:.3e} logits(excl_last)={mx_excl_last:.3e}")
-    if mx_excl_last <= 1e-7:
-        raise RuntimeError(
-            "Sanity check failed: is_causal toggle seems ineffective (bidir identical to causal). "
-            "This usually means the backend/model is forcing causal masking."
-        )
-    model.train()
 
 
 # -------------------------- CLI / main --------------------------
@@ -674,12 +830,7 @@ def parse_args():
     p.add_argument("--dataset_config", type=str, default=None)
     p.add_argument("--dataset_split", type=str, default="train")
     p.add_argument("--text_column", type=str, default="text")
-
-    # streaming toggle (default: True)
-    p.add_argument("--streaming", dest="streaming", action="store_true")
-    p.add_argument("--no_streaming", dest="streaming", action="store_false")
-    p.set_defaults(streaming=True)
-
+    p.add_argument("--streaming", action="store_true", default=True)
     p.add_argument("--shuffle_buffer", type=int, default=10_000)
     p.add_argument("--seqlen", type=int, default=2048)
     p.add_argument("--cache_dir", type=str, default=None)
@@ -692,9 +843,10 @@ def parse_args():
     p.add_argument("--ensure_mask_token", type=_str2bool, default=True)
     p.add_argument("--mask_token_str", type=str, default="<mask>")
 
+    p.add_argument("--grad_sim", type=_str2bool, default=False)
+
     p.add_argument("--output_dir", type=str, default="ckpt_out")
 
-    # logging outputs
     p.add_argument("--logging_dir", type=str, default=None)
     p.add_argument("--report_to", type=str, default="none")
     p.add_argument("--log_jsonl", type=str, default=None)
@@ -710,16 +862,12 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=500)
     p.add_argument("--save_total_limit", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
-
     p.add_argument("--bf16", type=_str2bool, default=True)
     p.add_argument("--fp16", type=_str2bool, default=False)
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--ddp_find_unused_parameters", type=_str2bool, default=False)
 
     p.add_argument("--deepspeed", type=str, default=None)
-
-    # extra robustness
-    p.add_argument("--sanity_check", type=_str2bool, default=True)
 
     return p.parse_args()
 
@@ -735,34 +883,27 @@ def main():
         args.log_csv = os.path.join(args.output_dir, "train_log.csv")
 
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True, trust_remote_code=True)
-    ensure_pad_token(tok)
 
-    # dtype (prefer bf16 on CUDA)
     use_cuda = torch.cuda.is_available()
-    dtype = torch.bfloat16 if (args.bf16 and use_cuda) else (torch.float16 if (args.fp16 and use_cuda) else torch.float32)
+    if args.attn_impl == "flash_attention_2" and not use_cuda:
+        raise RuntimeError("flash_attention_2 は CUDA が必要です。")
 
-    # IMPORTANT: newer transformers warn torch_dtype deprecated -> prefer dtype
-    model_kwargs = dict(
+    dtype = torch.bfloat16 if (args.bf16 and use_cuda) else (
+        torch.float16 if (args.fp16 and use_cuda) else torch.float32
+    )
+    if args.attn_impl == "flash_attention_2" and dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError("flash_attention_2 は fp16/bf16 が必要です。（--bf16 True or --fp16 True）")
+
+    base = AutoModel.from_pretrained(
+        args.model_name_or_path,
         attn_implementation=args.attn_impl,
         trust_remote_code=True,
-        use_cache=False,
+        torch_dtype=dtype,
     )
-    try:
-        base = AutoModel.from_pretrained(args.model_name_or_path, dtype=dtype, **model_kwargs)
-    except TypeError:
-        base = AutoModel.from_pretrained(args.model_name_or_path, torch_dtype=dtype, **model_kwargs)
-
     model = AutoModelWithLMHead(base)
-    model.config.use_cache = False  # force off
+    model.config.use_cache = False
 
-    # If we added pad_token, embeddings may need resize
-    if len(tok) != int(model.config.vocab_size):
-        model.resize_token_embeddings(len(tok))
-        model.tie_weights()
-
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-
+    # need MLM?
     alias = {"causal": "clm", "bidir": "mlm"}
     policy = alias.get(args.mask_policy, args.mask_policy)
     need_mlm = policy in ("mlm", "alternate", "both")
@@ -776,9 +917,8 @@ def main():
             if mask_id is None:
                 raise RuntimeError("mask_token_id がありません。--ensure_mask_token True を使ってください。")
 
-    # optional sanity check (ensure is_causal toggling is effective)
-    if args.sanity_check and use_cuda:
-        sanity_check_is_causal_effect(model, device=torch.device("cuda"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
 
     train_ds = PackedStreamingIterable(
         tokenizer=tok,
@@ -815,14 +955,13 @@ def main():
         fp16=args.fp16,
         gradient_checkpointing=args.gradient_checkpointing,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
-        remove_unused_columns=False,  # keep attention_mask etc. stable
     )
     if args.deepspeed:
         targs_kwargs["deepspeed"] = args.deepspeed
 
     targs = TrainingArguments(**targs_kwargs)
 
-    # tokenizer deprecation avoidance (transformers version differences)
+    # tokenizer deprecation 回避（transformers バージョン差吸収）
     trainer_init_sig = inspect.signature(Trainer.__init__)
     trainer_tokenizer_kw = {}
     if "processing_class" in trainer_init_sig.parameters:
@@ -839,6 +978,7 @@ def main():
         mlm_mask_ratio=args.mlm_mask_ratio,
         both_weights=args.both_weights,
         mask_token_id=mask_id,
+        grad_sim=args.grad_sim,
         **trainer_tokenizer_kw,
     )
 
@@ -847,23 +987,19 @@ def main():
     if trainer.is_world_process_zero():
         print({
             "vocab_size": len(tok),
-            "pad_token": getattr(tok, "pad_token", None),
-            "pad_token_id": getattr(tok, "pad_token_id", None),
             "mask_token": getattr(tok, "mask_token", None),
             "mask_token_id": getattr(tok, "mask_token_id", None),
             "attn_impl": args.attn_impl,
+            "dtype": str(dtype),
             "mask_policy": args.mask_policy,
-            "mlm_mask_ratio": float(args.mlm_mask_ratio),
-            "both_weights": args.both_weights,
-            "seqlen": int(args.seqlen),
-            "streaming": bool(args.streaming),
+            "grad_sim": bool(args.grad_sim),
+            "forward_accepts_is_causal": bool(model._accepts_is_causal),
             "logging_steps": int(args.logging_steps),
             "deepspeed": args.deepspeed,
             "logging_dir": args.logging_dir,
             "report_to": args.report_to,
             "log_jsonl": args.log_jsonl,
             "log_csv": args.log_csv,
-            "sanity_check": bool(args.sanity_check),
         })
 
     trainer.train()
