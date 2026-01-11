@@ -579,7 +579,7 @@ def main():
         weight_decay=float(args.weight_decay),
         logging_steps=int(args.logging_steps),
         save_strategy=args.save_strategy,
-        evaluation_strategy=args.eval_strategy,
+        eval_strategy=args.eval_strategy,
         eval_steps=int(args.eval_steps),
         report_to="none",
         remove_unused_columns=False,  # important for custom inputs (QA/IR)
