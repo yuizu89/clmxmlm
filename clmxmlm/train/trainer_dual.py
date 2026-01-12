@@ -49,7 +49,7 @@ def local_weight_norm(model) -> float:
     for p in m.parameters():
         v = p.detach().float()
         sq += float((v * v).sum().item())
-    return math.sqrt(max(sq, 1e-30_prob))
+    return math.sqrt(max(sq, 1e-30))
 
 
 class DualCLMMLMTrainer(Trainer):
