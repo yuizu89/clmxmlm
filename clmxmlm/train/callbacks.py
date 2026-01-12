@@ -18,7 +18,8 @@ class JsonlCsvLoggerCallback(TrainerCallback):
         "step", "epoch", "lr",
         "loss", "loss_clm", "loss_mlm",
         "tps_active", "tflops",
-        "grad_norm", "grad_norm_rms", "update_to_weight",
+        "grad_sim", "grad_norm", "grad_norm_rms",
+        "update_to_weight",
     ]
 
     def __init__(self, jsonl_path: Optional[str], csv_path: Optional[str], fields: Optional[List[str]] = None):
