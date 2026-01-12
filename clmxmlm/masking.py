@@ -158,3 +158,34 @@ def sanity_check_suffix_effect(
 
     def run(is_causal_flag: bool):
         with controller.set(is_causal_flag):
+            out = controller.backbone_forward(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"] if attn_mask_2d else None,
+                is_causal=is_causal_flag,
+                use_cache=False,
+                return_dict=True,
+            )
+            h = out.last_hidden_state
+            logits = lm_head(h)
+            return logits
+
+    logits_c = run(True)
+    logits_b = run(False)
+
+    a = logits_c[0, pos, :]
+    b = logits_c[1, pos, :]
+    diff_c = float((a - b).abs().max().item())
+
+    a = logits_b[0, pos, :]
+    b = logits_b[1, pos, :]
+    diff_b = float((a - b).abs().max().item())
+
+    return {
+        "prefix_len": pref_len,
+        "pos": pos,
+        "diff_causal": diff_c,
+        "diff_bidir": diff_b,
+        "accepts_is_causal": bool(controller.accepts_is_causal),
+        "n_is_causal_modules": int(len(controller.mods)),
+        "backbone_type": str(type(backbone)),
+    }
