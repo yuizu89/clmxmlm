@@ -70,6 +70,7 @@ def parse_args():
     # logging files
     p.add_argument("--log_jsonl", type=str, default=None)
     p.add_argument("--log_csv", type=str, default=None)
+    p.add_argument("--grad_sim", nargs="?", const=True, default=False, type=_str2bool, help="Log-stepごとに grad_sim を計算してログ出力（重い）",)
 
     # optional: sanity check before train
     p.add_argument("--sanity_check", type=_str2bool, default=True)
@@ -200,6 +201,7 @@ def main():
         mlm_mask_ratio=args.mlm_mask_ratio,
         both_weights=args.both_weights,
         mask_token_id=mask_id,
+        grad_sim=args.grad_sim,
         **trainer_tokenizer_kw,
     )
     trainer.add_callback(JsonlCsvLoggerCallback(jsonl_path=args.log_jsonl, csv_path=args.log_csv))

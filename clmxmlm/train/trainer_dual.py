@@ -77,6 +77,7 @@ class DualCLMMLMTrainer(Trainer):
         mlm_mask_ratio: float = 0.15,
         both_weights: str = "1.0,1.0",
         mask_token_id: Optional[int] = None,
+        grad_sim: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -117,6 +118,12 @@ class DualCLMMLMTrainer(Trainer):
         self._step_start_time: Optional[float] = None
         self._micro_in_step: int = 0
         self._pending_grad_stats: Optional[Dict[str, float]] = None
+
+        # ---- grad_sim ----
+        self.grad_sim_enabled = bool(grad_sim)
+        self._can_grad_sim = (self.mask_policy == "both")  # both のときだけ意味がある想定
+        self._pending_grad_sim: Optional[Dict[str, float]] = None
+        self._last_mlm_xy: Optional[Tuple[torch.Tensor, torch.Tensor]] = None  # (x_mlm, y_mlm)
 
     def _reset_interval(self):
         self._int_micro = 0
@@ -189,6 +196,11 @@ class DualCLMMLMTrainer(Trainer):
                 special_ids=self._special_ids,
                 rng=self._rng,
             )
+
+            # ---- grad_sim 用に「このステップで使った MLM マスク」を保存 ----
+            if self.grad_sim_enabled and self._can_grad_sim:
+                self._last_mlm_xy = (x_mlm.detach(), y_mlm.detach())
+
             logits = self._backbone_logits(x_mlm, attention_mask, is_causal=False)
             loss_mlm = self._mlm_loss(logits, y_mlm)
             active += int(nmask)
@@ -215,6 +227,90 @@ class DualCLMMLMTrainer(Trainer):
         self._int_tokens_base += int(B * S * passes)
 
         return (loss_total, None) if return_outputs else loss_total
+
+    def _compute_grad_sim_all_params(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """
+        grad_sim: cosine similarity between grad(loss_clm) and grad(loss_mlm).
+        - 追加の forward + autograd.grad を行う（=重い）
+        - .grad を汚さない（autograd.gradなので optimizer 勾配には影響しない）
+        """
+        device = next(self.model.parameters()).device
+        t0 = time.time()
+        out: Dict[str, float] = {"grad_sim": float("nan"), "grad_sim_oom": 0.0}
+
+        params = [p for p in self.model.parameters() if p.requires_grad]
+
+        try:
+            with self.compute_loss_context_manager():
+                input_ids = inputs["input_ids"]
+                attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
+
+                # ---- CLM ----
+                logits_c = self._backbone_logits(input_ids, attention_mask, is_causal=True)
+                loss_clm = self._clm_loss(logits_c, input_ids, attention_mask)
+
+                # ---- MLM (保存しておいたマスクがあればそれを使う) ----
+                if self._last_mlm_xy is not None:
+                    x_mlm, y_mlm = self._last_mlm_xy
+                else:
+                    x_mlm, y_mlm, _ = build_mlm_batch(
+                        input_ids=input_ids,
+                        mask_token_id=int(self.mask_token_id),
+                        mask_ratio=float(self.mlm_mask_ratio),
+                        special_ids=self._special_ids,
+                        rng=self._rng,
+                    )
+
+                logits_m = self._backbone_logits(x_mlm, attention_mask, is_causal=False)
+                loss_mlm = self._mlm_loss(logits_m, y_mlm)
+
+            grads_c = torch.autograd.grad(loss_clm, params, allow_unused=True)
+            grads_m = torch.autograd.grad(loss_mlm, params, allow_unused=True)
+
+            dot = torch.zeros((), device=device, dtype=torch.float64)
+            na  = torch.zeros((), device=device, dtype=torch.float64)
+            nb  = torch.zeros((), device=device, dtype=torch.float64)
+            den = torch.zeros((), device=device, dtype=torch.float64)
+
+            for gc, gm in zip(grads_c, grads_m):
+                if gc is None or gm is None:
+                    continue
+                gc = gc.detach().float()
+                gm = gm.detach().float()
+                dot = dot + (gc * gm).sum(dtype=torch.float64)
+                na  = na  + (gc * gc).sum(dtype=torch.float64)
+                nb  = nb  + (gm * gm).sum(dtype=torch.float64)
+                den = den + float(gc.numel())
+
+            dotv = float(dot.item())
+            nav  = float(na.item())
+            nbv  = float(nb.item())
+            denv = float(den.item())
+
+            cos = dotv / (math.sqrt(max(nav, 1e-30)) * math.sqrt(max(nbv, 1e-30)) + 1e-30)
+
+            out["grad_sim"] = float(cos)
+            out["grad_norm_clm"] = math.sqrt(max(nav, 1e-30))
+            out["grad_norm_mlm"] = math.sqrt(max(nbv, 1e-30))
+
+            if denv > 0.0:
+                out["grad_norm_clm_rms"] = math.sqrt(max(nav / denv, 1e-30))
+                out["grad_norm_mlm_rms"] = math.sqrt(max(nbv / denv, 1e-30))
+
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "out of memory" in msg or "cuda oom" in msg:
+                out["grad_sim_oom"] = 1.0
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            else:
+                raise
+
+        out["grad_sim_ms"] = (time.time() - t0) * 1000.0
+        return out
+
 
     def _compute_lr(self) -> float:
         try:
@@ -257,6 +353,9 @@ class DualCLMMLMTrainer(Trainer):
                     "grad_norm_rms": float(grms),
                     "update_to_weight": float(upd2w),
                 }
+                # ---- grad_sim（重いので log step のみ）----
+                if self.grad_sim_enabled and self._can_grad_sim:
+                    self._pending_grad_sim = self._compute_grad_sim_all_params(inputs)
 
             step_dt = max(1e-9, time.time() - self._step_start_time)
             self._int_step_time += float(step_dt)
@@ -313,6 +412,27 @@ class DualCLMMLMTrainer(Trainer):
             out["grad_norm_rms"] = round(float(self._pending_grad_stats["grad_norm_rms"]), 6)
             out["update_to_weight"] = round(float(self._pending_grad_stats["update_to_weight"]), 6)
             self._pending_grad_stats = None
+
+        if self._pending_grad_sim is not None:
+            gs = self._pending_grad_sim
+            if "grad_sim" in gs and gs["grad_sim"] == gs["grad_sim"]:
+                out["grad_sim"] = round(float(gs["grad_sim"]), 6)
+            else:
+                out["grad_sim"] = gs.get("grad_sim", float("nan"))
+
+            if "grad_norm_clm" in gs:
+                out["grad_norm_clm"] = round(float(gs["grad_norm_clm"]), 4)
+            if "grad_norm_mlm" in gs:
+                out["grad_norm_mlm"] = round(float(gs["grad_norm_mlm"]), 4)
+            if "grad_norm_clm_rms" in gs:
+                out["grad_norm_clm_rms"] = round(float(gs["grad_norm_clm_rms"]), 6)
+            if "grad_norm_mlm_rms" in gs:
+                out["grad_norm_mlm_rms"] = round(float(gs["grad_norm_mlm_rms"]), 6)
+
+            out["grad_sim_ms"] = round(float(gs.get("grad_sim_ms", 0.0)), 2)
+            out["grad_sim_oom"] = float(gs.get("grad_sim_oom", 0.0))
+            self._pending_grad_sim = None
+
 
         self._reset_interval()
 
