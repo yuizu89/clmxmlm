@@ -6,7 +6,7 @@ import json
 import time
 import argparse
 import inspect
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 
 import numpy as np
 from tqdm import tqdm
@@ -22,11 +22,15 @@ from transformers import (
     default_data_collator,
 )
 from datasets import Dataset
-
 import evaluate
 
 # ---- current package imports ----
-from ..masking import get_backbone_from_causallm
+from ..masking import (
+    get_backbone_from_causallm,
+    MaskController,
+    sanity_check_suffix_effect,
+)
+from ..modeling import get_lm_head_module
 
 # eval_ft local modules
 from .heads import (
@@ -42,6 +46,7 @@ from . import tasks as T
 # ---------------------- utils ----------------------
 def set_seed(seed: int):
     import random
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -101,15 +106,11 @@ def _make_training_args(args, run_dir: str, use_cuda: bool):
     if "warmup_ratio" in sig:
         kw["warmup_ratio"] = float(args.warmup_ratio)
     else:
-        # fallback: convert ratio -> steps (best-effort)
         kw["warmup_steps"] = max(0, int(float(args.warmup_ratio) * max(1, int(args.max_steps))))
 
     # save/eval strategy naming differences
     if "save_strategy" in sig:
         kw["save_strategy"] = args.save_strategy
-    elif "save_steps" in sig:
-        # older versions sometimes rely on save_steps; keep default behavior
-        pass
 
     if "evaluation_strategy" in sig:
         kw["evaluation_strategy"] = args.eval_strategy
@@ -131,8 +132,16 @@ def build_sc(tokenizer, train_ds, eval_ds, task: str, max_length: int):
             return tokenizer(ex[k1], truncation=True, max_length=max_length)
         return tokenizer(ex[k1], ex[k2], truncation=True, max_length=max_length)
 
-    train_tok = train_ds.map(tok_fn, batched=True, remove_columns=[c for c in train_ds.column_names if c not in ("label",)])
-    eval_tok = eval_ds.map(tok_fn, batched=True, remove_columns=[c for c in eval_ds.column_names if c not in ("label",)])
+    train_tok = train_ds.map(
+        tok_fn,
+        batched=True,
+        remove_columns=[c for c in train_ds.column_names if c not in ("label",)],
+    )
+    eval_tok = eval_ds.map(
+        tok_fn,
+        batched=True,
+        remove_columns=[c for c in eval_ds.column_names if c not in ("label",)],
+    )
 
     train_tok = train_tok.rename_column("label", "labels")
     eval_tok = eval_tok.rename_column("label", "labels")
@@ -221,7 +230,6 @@ def build_tc(tokenizer, train_ds, eval_ds, label_list: List[str], tok_col: str, 
 # ---------------------- QA ----------------------
 def build_qa_features(tokenizer, train_ds: Dataset, eval_ds: Dataset, task: str, max_length: int, doc_stride: int = 128):
     pad_on_right = True
-
     if task == "qa_record":
         q_col, c_col = "query", "passage"
     else:
@@ -507,6 +515,8 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default="encodeval_ft_results")
 
     p.add_argument("--ft_mask", type=str, default="bidir", choices=["bidir", "causal"])
+    p.add_argument("--mask_sanity", action="store_true", help="run bidir/causal sanity check and exit")
+    p.add_argument("--mask_sanity_strict", action="store_true", help="fail if bidir does not differ from causal")
 
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
@@ -568,9 +578,31 @@ def main():
     hidden = infer_hidden_size(backbone)
     mask_cfg = FTMaskCfg(ft_mask=args.ft_mask)
 
+    # ---- sanity check (bidir vs causal) at backbone level ----
+    lm_head = get_lm_head_module(m)
+    controller = MaskController(backbone)
+    sc = sanity_check_suffix_effect(
+        tokenizer=tok,
+        backbone=backbone,
+        lm_head=lm_head,
+        device=device,
+        controller=controller,
+        attn_mask_2d=True,
+    )
+    print("[mask sanity]", sc)
+
+    if args.mask_sanity:
+        # just diagnostics
+        return
+
+    if args.mask_sanity_strict:
+        # strict: bidir must be measurably different from causal
+        if not (sc["diff_causal"] < 1e-4 and sc["diff_bidir"] > 1e-3):
+            raise RuntimeError(f"Mask sanity failed: {sc}")
+
     targs = _make_training_args(args, run_dir=run_dir, use_cuda=use_cuda)
 
-    results: Dict[str, Any] = {"args": vars(args)}
+    results: Dict[str, Any] = {"args": vars(args), "mask_sanity": sc}
 
     # ---- dispatch ----
     if args.task in T.SC_TASKS:
