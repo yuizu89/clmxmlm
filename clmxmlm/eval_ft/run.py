@@ -29,7 +29,7 @@ import evaluate
 from ..masking import get_backbone_from_causallm
 
 # eval_ft local modules
-from .modeling import (
+from .heads import (
     FTMaskCfg,
     DecoderOnlyForSequenceClassification,
     DecoderOnlyForTokenClassification,
