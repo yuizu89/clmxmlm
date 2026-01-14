@@ -5,7 +5,7 @@ import os
 import json
 import argparse
 import inspect
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple, Union
 
 import numpy as np
 from tqdm import tqdm
@@ -74,20 +74,6 @@ def _trainer_tokenizer_kw(tok):
     if "processing_class" in sig.parameters:
         return {"processing_class": tok}
     return {"tokenizer": tok}
-
-
-def _trainer_ignore_keys_kw(ignore_keys: List[str]):
-    """
-    transformers のバージョン差を吸収しつつ、eval時に outputs の不要キーを無視する。
-    （QAで hidden_states=None 等が混ざって accelerate 側で落ちるのを防ぐ）
-    """
-    sig = inspect.signature(Trainer.__init__)
-    if "ignore_keys_for_eval" in sig.parameters:
-        return {"ignore_keys_for_eval": ignore_keys}
-    # 古い版で ignore_keys がある場合
-    if "ignore_keys" in sig.parameters:
-        return {"ignore_keys": ignore_keys}
-    return {}
 
 
 def _make_training_args(args, run_dir: str, use_cuda: bool):
@@ -443,6 +429,62 @@ def postprocess_qa_predictions(examples: Dataset, features: Dataset, raw_predict
     return preds
 
 
+def _qa_sanitize_logits(logits) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Trainer/Accelerate が pad_across_processes する logits に None が混ざると落ちる。
+    ここで (start_logits, end_logits) だけに正規化する。
+    """
+    # dict / ModelOutput 形式
+    if isinstance(logits, dict):
+        sl = logits.get("start_logits", None)
+        el = logits.get("end_logits", None)
+        if sl is not None and el is not None:
+            return sl, el
+        # それ以外は、tensorだけ抽出して先頭2つを使う
+        ts = [v for v in logits.values() if torch.is_tensor(v)]
+        if len(ts) >= 2:
+            return ts[0], ts[1]
+        raise RuntimeError(f"Cannot extract QA logits from dict keys={list(logits.keys())}")
+
+    # tuple/list 形式（ここが一番多い：(..., None, None) を含む）
+    if isinstance(logits, (tuple, list)):
+        ts = [x for x in logits if torch.is_tensor(x)]
+        if len(ts) >= 2:
+            return ts[0], ts[1]
+        raise RuntimeError(f"Cannot extract QA logits from tuple/list: {type(logits)} len={len(logits)}")
+
+    # tensor単体（想定外だが一応）
+    if torch.is_tensor(logits):
+        raise RuntimeError("QA logits must be (start_logits, end_logits) but got a single tensor.")
+
+    raise RuntimeError(f"Unsupported logits type for QA: {type(logits)}")
+
+
+class QATrainer(Trainer):
+    """
+    QA の evaluate で accelerate.pad_across_processes が None を踏む問題を回避するため、
+    prediction_step の logits を (start_logits, end_logits) に正規化する。
+    """
+
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ):
+        loss, logits, labels = super().prediction_step(
+            model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
+        )
+
+        # logits が None を含む tuple/dict だとここで落ちるので sanitize
+        if logits is not None:
+            sl, el = _qa_sanitize_logits(logits)
+            logits = (sl, el)
+
+        return loss, logits, labels
+
+
 # ---------------------- IR (optional) ----------------------
 def run_ir_optional(args, tokenizer, backbone, mask_cfg: FTMaskCfg):
     try:
@@ -696,7 +738,7 @@ def main():
         qa_collator = DataCollatorWithPadding(tok)
 
         def compute_metrics_for_qa(p):
-            # p.predictions は (start_logits, end_logits) を期待
+            # p.predictions は (start_logits, end_logits) を期待（QATrainerが保証）
             preds = postprocess_qa_predictions(eval_ds, eval_feat, p.predictions)
             if args.task == "qa_record":
                 predictions = []
@@ -714,10 +756,8 @@ def main():
                 refs = [{"id": ex["id"], "answers": ex["answers"]} for ex in eval_ds]
                 return metric.compute(predictions=formatted_preds, references=refs)
 
-        # QA output に hidden_states=None / attentions=None が混ざると accelerate が落ちるので無視
-        ignore_keys = ["past_key_values", "hidden_states", "attentions"]
-
-        trainer = Trainer(
+        # ★ここがポイント：QATrainer を使う（logits から None を除去して (start,end) に固定）
+        trainer = QATrainer(
             model=model,
             args=targs,
             train_dataset=train_feat,
@@ -725,7 +765,6 @@ def main():
             data_collator=qa_collator,
             compute_metrics=compute_metrics_for_qa,
             **_trainer_tokenizer_kw(tok),
-            **_trainer_ignore_keys_kw(ignore_keys),
         )
 
         trainer.train()
