@@ -19,7 +19,6 @@ from transformers import (
     DataCollatorWithPadding,
     DataCollatorForTokenClassification,
 )
-
 from datasets import Dataset
 import evaluate
 
@@ -75,6 +74,20 @@ def _trainer_tokenizer_kw(tok):
     if "processing_class" in sig.parameters:
         return {"processing_class": tok}
     return {"tokenizer": tok}
+
+
+def _trainer_ignore_keys_kw(ignore_keys: List[str]):
+    """
+    transformers のバージョン差を吸収しつつ、eval時に outputs の不要キーを無視する。
+    （QAで hidden_states=None 等が混ざって accelerate 側で落ちるのを防ぐ）
+    """
+    sig = inspect.signature(Trainer.__init__)
+    if "ignore_keys_for_eval" in sig.parameters:
+        return {"ignore_keys_for_eval": ignore_keys}
+    # 古い版で ignore_keys がある場合
+    if "ignore_keys" in sig.parameters:
+        return {"ignore_keys": ignore_keys}
+    return {}
 
 
 def _make_training_args(args, run_dir: str, use_cuda: bool):
@@ -675,15 +688,15 @@ def main():
             tok, train_ds, eval_ds, args.task, args.max_length, doc_stride=args.doc_stride
         )
 
-        # Trainer の batching で tensor 化できない列(offset_mapping/example_id)を落とす。
-        # ※ postprocess 用に eval_feat (offset付き) 自体は保持する。
+        # Trainer が tensor 化できない列を eval_dataset から除去（postprocess 用の eval_feat は保持）
         drop_cols = [c for c in ("offset_mapping", "example_id") if c in eval_feat.column_names]
         eval_dataset_for_trainer = eval_feat.remove_columns(drop_cols) if drop_cols else eval_feat
 
-        # 可変長 input_ids をパディングしてバッチ化する
+        # 可変長 input_ids を padding してバッチ化
         qa_collator = DataCollatorWithPadding(tok)
 
         def compute_metrics_for_qa(p):
+            # p.predictions は (start_logits, end_logits) を期待
             preds = postprocess_qa_predictions(eval_ds, eval_feat, p.predictions)
             if args.task == "qa_record":
                 predictions = []
@@ -701,6 +714,9 @@ def main():
                 refs = [{"id": ex["id"], "answers": ex["answers"]} for ex in eval_ds]
                 return metric.compute(predictions=formatted_preds, references=refs)
 
+        # QA output に hidden_states=None / attentions=None が混ざると accelerate が落ちるので無視
+        ignore_keys = ["past_key_values", "hidden_states", "attentions"]
+
         trainer = Trainer(
             model=model,
             args=targs,
@@ -709,6 +725,7 @@ def main():
             data_collator=qa_collator,
             compute_metrics=compute_metrics_for_qa,
             **_trainer_tokenizer_kw(tok),
+            **_trainer_ignore_keys_kw(ignore_keys),
         )
 
         trainer.train()
