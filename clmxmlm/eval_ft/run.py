@@ -461,11 +461,6 @@ def _qa_sanitize_logits(logits) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 class QATrainer(Trainer):
-    """
-    QA の evaluate で accelerate.pad_across_processes が None を踏む問題を回避するため、
-    prediction_step の logits を (start_logits, end_logits) に正規化する。
-    """
-
     def prediction_step(
         self,
         model,
@@ -477,12 +472,17 @@ class QATrainer(Trainer):
             model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
         )
 
-        # logits が None を含む tuple/dict だとここで落ちるので sanitize
         if logits is not None:
             sl, el = _qa_sanitize_logits(logits)
             logits = (sl, el)
 
+            # ★ここが追加：eval_datasetにlabelsが無いと compute_metrics が呼ばれないのでダミーを作る
+            if labels is None:
+                # shape は (batch, 1) などなら何でもOK（compute_metrics側で参照しない）
+                labels = torch.zeros((sl.shape[0], 1), dtype=torch.long, device=sl.device)
+
         return loss, logits, labels
+
 
 
 # ---------------------- IR (optional) ----------------------
