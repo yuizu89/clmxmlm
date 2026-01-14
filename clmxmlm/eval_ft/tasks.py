@@ -1,4 +1,4 @@
-# encodeval_ft/tasks.py
+# clmxmlm/eval_ft/tasks.py
 from __future__ import annotations
 
 import re
@@ -114,12 +114,23 @@ def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
     # label names
     feat = train.features[lab_col]
     if hasattr(feat, "feature") and hasattr(feat.feature, "names"):
+        # e.g., Sequence(ClassLabel(...))
         label_list = list(feat.feature.names)
     elif hasattr(feat, "names"):
+        # e.g., ClassLabel(...)
         label_list = list(feat.names)
     else:
-        # fallback
-        label_list = [str(i) for i in range(int(np.max(train[lab_col])) + 1)]
+        # fallback (robust): train[lab_col] is usually List[List[int]]
+        max_id = -1
+        for seq in train[lab_col]:
+            if not seq:
+                continue
+            m = max(seq)
+            if m > max_id:
+                max_id = m
+        if max_id < 0:
+            max_id = 0
+        label_list = [str(i) for i in range(int(max_id) + 1)]
 
     return train, eval_ds, label_list, (tok_col, lab_col)
 
