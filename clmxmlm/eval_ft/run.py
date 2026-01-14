@@ -285,13 +285,18 @@ def build_qa_features(tokenizer, train_ds: Dataset, eval_ds: Dataset, task: str,
                 end_positions.append(0)
                 continue
 
+            # ---- robust answer_start handling for batched datasets ----
             if task == "qa_record":
                 start_char = context.find(answer_text)
             else:
-                ans_obj = examples.get("answers", None)
-                if isinstance(ans_obj, dict) and "answer_start" in ans_obj:
-                    start_char = int(ans_obj["answer_start"][sample_idx][0]) if ans_obj["answer_start"][sample_idx] else -1
-                else:
+                # SQuAD/SQuADv2 batched map: examples["answers"] is List[Dict[text, answer_start]]
+                ans_entry = examples.get("answers", None)
+                start_char = -1
+                if isinstance(ans_entry, list) and sample_idx < len(ans_entry):
+                    ae = ans_entry[sample_idx]
+                    if isinstance(ae, dict) and "answer_start" in ae and ae["answer_start"]:
+                        start_char = int(ae["answer_start"][0])
+                if start_char < 0:
                     start_char = context.find(answer_text)
 
             if start_char < 0:
@@ -304,6 +309,7 @@ def build_qa_features(tokenizer, train_ds: Dataset, eval_ds: Dataset, task: str,
             sequence_ids = tokenized.sequence_ids(i)
             ctx_index = 1 if pad_on_right else 0
 
+            # Find context span in tokens
             token_start = 0
             while token_start < len(sequence_ids) and sequence_ids[token_start] != ctx_index:
                 token_start += 1
@@ -311,17 +317,33 @@ def build_qa_features(tokenizer, train_ds: Dataset, eval_ds: Dataset, task: str,
             while token_end >= 0 and sequence_ids[token_end] != ctx_index:
                 token_end -= 1
 
+            # Guard: if no context span found
+            if token_start >= len(sequence_ids) or token_end < 0 or token_start > token_end:
+                start_positions.append(0)
+                end_positions.append(0)
+                continue
+
+            # If answer not fully inside this window, label as (0,0)
             if not (offsets[token_start][0] <= start_char and offsets[token_end][1] >= end_char):
                 start_positions.append(0)
                 end_positions.append(0)
             else:
-                while token_start < len(offsets) and offsets[token_start][0] <= start_char:
-                    token_start += 1
-                start_positions.append(token_start - 1)
+                # IMPORTANT: keep original context span bounds
+                ctx_start = token_start
+                ctx_end = token_end
 
-                while offsets[token_end][1] >= end_char:
-                    token_end -= 1
-                end_positions.append(token_end + 1)
+                start = ctx_start
+                while start <= ctx_end and offsets[start][0] <= start_char:
+                    start += 1
+                sp = max(ctx_start, start - 1)
+
+                end = ctx_end
+                while end >= ctx_start and offsets[end][1] >= end_char:
+                    end -= 1
+                ep = min(ctx_end, end + 1)
+
+                start_positions.append(int(sp))
+                end_positions.append(int(ep))
 
         tokenized["start_positions"] = start_positions
         tokenized["end_positions"] = end_positions
