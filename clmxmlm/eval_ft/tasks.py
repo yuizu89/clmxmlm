@@ -9,49 +9,15 @@ from datasets import load_dataset, Dataset, DatasetDict, get_dataset_config_name
 import evaluate
 
 
-# ---------- Sequence Classification (GLUE) ----------
-SC_TASKS = {
-    "sc_sst2": {"path": "glue", "name": "sst2"},
-    "sc_mnli": {"path": "glue", "name": "mnli"},
-    "sc_qqp":  {"path": "glue", "name": "qqp"},
-}
-
-SC_KEYS = {
-    "sc_sst2": ("sentence", None),
-    "sc_mnli": ("premise", "hypothesis"),
-    "sc_qqp":  ("question1", "question2"),
-}
-
-
-# ---------- Token Classification (NER) ----------
-TC_TASKS = {
-    "tc_conll2003": {"path": "conll2003", "name": None},
-    "tc_ontonotes5": {"path": "tner/ontonotes5", "name": None},
-    "tc_uner_en": {"path": "universalner/universal_ner", "name": None},
-}
-
-TC_FIELD_CANDIDATES = [
-    ("tokens", "ner_tags"),
-    ("tokens", "tags"),
-    ("words", "ner_tags"),
-    ("sentence", "labels"),
-]
-
-
-# ---------- QA ----------
-QA_TASKS = {
-    "qa_squad": {"path": "squad", "name": None, "metric": ("squad", None)},
-    "qa_squad_v2": {"path": "squad_v2", "name": None, "metric": ("squad_v2", None)},
-    "qa_record": {"path": "super_glue", "name": "record", "metric": ("super_glue", "record")},
-}
-
-
-# ---------- IR ----------
-IR_TASKS = {
-    "ir_msmarco": {"path": "BeIR/msmarco", "name": None},
-    "ir_nq": {"path": "BeIR/nq", "name": None},
-    "ir_mldr_en": {"path": "Shitao/MLDR", "name": None, "lang": "en"},
-}
+# ---------- helpers ----------
+def _load_dataset(*args, **kwargs):
+    """
+    HF datasets の一部は custom code を含み、datasets>= の設定で
+    trust_remote_code=True を明示しないとロードできないことがあります（例: conll2003）。
+    非対話環境（Colabのbash実行）でプロンプトが出ると落ちるので、ここで統一的に許可します。
+    """
+    kwargs.setdefault("trust_remote_code", True)
+    return load_dataset(*args, **kwargs)
 
 
 def _pick_split(dsd: DatasetDict, preferred: List[str]) -> Dataset:
@@ -69,9 +35,23 @@ def _pick_split_with_name(dsd: DatasetDict, preferred: List[str]) -> Tuple[Datas
     return dsd[k], k
 
 
+# ---------- Sequence Classification (GLUE) ----------
+SC_TASKS = {
+    "sc_sst2": {"path": "glue", "name": "sst2"},
+    "sc_mnli": {"path": "glue", "name": "mnli"},
+    "sc_qqp":  {"path": "glue", "name": "qqp"},
+}
+
+SC_KEYS = {
+    "sc_sst2": ("sentence", None),
+    "sc_mnli": ("premise", "hypothesis"),
+    "sc_qqp":  ("question1", "question2"),
+}
+
+
 def load_sc(task: str) -> Tuple[Dataset, Dataset, int]:
     spec = SC_TASKS[task]
-    dsd = load_dataset(spec["path"], spec["name"])
+    dsd = _load_dataset(spec["path"], spec["name"])
     if task == "sc_mnli":
         train = dsd["train"]
         eval_ds = dsd["validation_matched"]
@@ -80,6 +60,21 @@ def load_sc(task: str) -> Tuple[Dataset, Dataset, int]:
         eval_ds = dsd["validation"]
     num_labels = int(train.features["label"].num_classes)
     return train, eval_ds, num_labels
+
+
+# ---------- Token Classification (NER) ----------
+TC_TASKS = {
+    "tc_conll2003": {"path": "conll2003", "name": None},
+    "tc_ontonotes5": {"path": "tner/ontonotes5", "name": None},
+    "tc_uner_en": {"path": "universalner/universal_ner", "name": None},  # auto-pick English config
+}
+
+TC_FIELD_CANDIDATES = [
+    ("tokens", "ner_tags"),
+    ("tokens", "tags"),
+    ("words", "ner_tags"),
+    ("sentence", "labels"),
+]
 
 
 def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
@@ -91,13 +86,15 @@ def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
         if not eng:
             raise RuntimeError(f"Could not find English config in {spec['path']} configs: {cfgs[:20]}...")
         cfg = sorted(eng)[0]
-        dsd = load_dataset(spec["path"], cfg)
+        dsd = _load_dataset(spec["path"], cfg)
     else:
-        dsd = load_dataset(spec["path"])
+        # conll2003 などは trust_remote_code=True が必要になるケースがある
+        dsd = _load_dataset(spec["path"])
 
     train = _pick_split(dsd, ["train", "training"])
     eval_ds = _pick_split(dsd, ["validation", "valid", "dev"])
 
+    # find token/label columns
     tok_col, lab_col = None, None
     for a, b in TC_FIELD_CANDIDATES:
         if a in train.column_names and b in train.column_names:
@@ -106,7 +103,7 @@ def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
     if tok_col is None:
         raise RuntimeError(f"Could not find token/label columns in {task}. columns={train.column_names}")
 
-    # label names: prefer feature metadata (works for conll2003 etc.)
+    # label names: prefer dataset feature metadata
     feat = train.features[lab_col]
     label_list = None
     try:
@@ -118,7 +115,7 @@ def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
         label_list = None
 
     if label_list is None:
-        # fallback: scan (avoid np.max on ragged lists)
+        # fallback: scan ragged sequences safely (avoid np.max on list-of-lists)
         mx = 0
         for seq in train[lab_col]:
             if not seq:
@@ -129,9 +126,17 @@ def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
     return train, eval_ds, label_list, (tok_col, lab_col)
 
 
+# ---------- QA ----------
+QA_TASKS = {
+    "qa_squad": {"path": "squad", "name": None, "metric": ("squad", None)},
+    "qa_squad_v2": {"path": "squad_v2", "name": None, "metric": ("squad_v2", None)},
+    "qa_record": {"path": "super_glue", "name": "record", "metric": ("super_glue", "record")},
+}
+
+
 def load_qa(task: str) -> Tuple[Dataset, Dataset, Any]:
     spec = QA_TASKS[task]
-    dsd = load_dataset(spec["path"], spec["name"]) if spec["name"] else load_dataset(spec["path"])
+    dsd = _load_dataset(spec["path"], spec["name"]) if spec["name"] else _load_dataset(spec["path"])
     train = _pick_split(dsd, ["train"])
     eval_ds = _pick_split(dsd, ["validation", "dev"])
 
@@ -140,21 +145,24 @@ def load_qa(task: str) -> Tuple[Dataset, Dataset, Any]:
     return train, eval_ds, metric
 
 
+# ---------- IR ----------
+IR_TASKS = {
+    "ir_msmarco": {"path": "BeIR/msmarco", "name": None},
+    "ir_nq": {"path": "BeIR/nq", "name": None},
+    "ir_mldr_en": {"path": "Shitao/MLDR", "name": None, "lang": "en"},
+}
+
+
 def load_ir(task: str) -> Dict[str, Any]:
     """
-    Returns dict with:
-      - corpus: Dataset
-      - queries: Dataset
-      - qrels: Dataset (if available)
-    For some BEIR datasets on HF, qrels are in a separate dataset "<path>-qrels"
-    (e.g., BeIR/msmarco-qrels). :contentReference[oaicite:2]{index=2}
+    BEIR の一部は qrels が別データセット "<path>-qrels" になっています（例: BeIR/msmarco-qrels）。
     """
     spec = IR_TASKS[task]
     path = spec["path"]
 
     def try_load_subset(ds_path: str, subset: str):
         try:
-            return load_dataset(ds_path, subset)
+            return _load_dataset(ds_path, subset)
         except Exception:
             return None
 
@@ -174,19 +182,18 @@ def load_ir(task: str) -> Dict[str, Any]:
     out["queries"] = queries_ds
     out["queries_split"] = queries_split
 
-    # qrels: 1) same dataset subset "qrels"  2) fallback to "<path>-qrels"
+    # qrels: 1) same dataset subset "qrels" 2) fallback to "<path>-qrels"
     dd_qrels = try_load_subset(path, "qrels")
 
     if dd_qrels is None:
-        qrels_path = pathpath = path + "-qrels" if not path.endswith("-qrels") else path
+        qrels_path = path if path.endswith("-qrels") else (path + "-qrels")
         try:
-            dd_qrels = load_dataset(qrels_path)  # note: no subset
+            dd_qrels = _load_dataset(qrels_path)
             out["qrels_path"] = qrels_path
         except Exception:
             dd_qrels = None
 
     if dd_qrels is not None:
-        # match split with queries if possible
         if isinstance(dd_qrels, DatasetDict) and queries_split in dd_qrels:
             out["qrels"] = dd_qrels[queries_split]
         else:
