@@ -1,9 +1,8 @@
-# clmxmlm/eval_ft/tasks.py
+# encodeval_ft/tasks.py
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 from datasets import load_dataset, Dataset, DatasetDict, get_dataset_config_names
@@ -17,7 +16,6 @@ SC_TASKS = {
     "sc_qqp":  {"path": "glue", "name": "qqp"},
 }
 
-# GLUE key mapping
 SC_KEYS = {
     "sc_sst2": ("sentence", None),
     "sc_mnli": ("premise", "hypothesis"),
@@ -26,16 +24,12 @@ SC_KEYS = {
 
 
 # ---------- Token Classification (NER) ----------
-# CoNLL2003 is standard on HF
-# OntoNotes NER: tner/ontonotes5 is commonly used as NER-ready subset
-# UNER: universalner/universal_ner; pick English configs dynamically
 TC_TASKS = {
     "tc_conll2003": {"path": "conll2003", "name": None},
     "tc_ontonotes5": {"path": "tner/ontonotes5", "name": None},
-    "tc_uner_en": {"path": "universalner/universal_ner", "name": None},  # we'll auto-pick an English config
+    "tc_uner_en": {"path": "universalner/universal_ner", "name": None},
 }
 
-# Token/label field candidates (dataset-dependent)
 TC_FIELD_CANDIDATES = [
     ("tokens", "ner_tags"),
     ("tokens", "tags"),
@@ -53,8 +47,6 @@ QA_TASKS = {
 
 
 # ---------- IR ----------
-# BEIR via datasets: BeIR/nq, BeIR/msmarco (for eval)
-# MLDR: Shitao/MLDR (has corpus + queries + qrels style fields; but structure differs)
 IR_TASKS = {
     "ir_msmarco": {"path": "BeIR/msmarco", "name": None},
     "ir_nq": {"path": "BeIR/nq", "name": None},
@@ -66,14 +58,20 @@ def _pick_split(dsd: DatasetDict, preferred: List[str]) -> Dataset:
     for k in preferred:
         if k in dsd:
             return dsd[k]
-    # fallback: first split
     return dsd[list(dsd.keys())[0]]
+
+
+def _pick_split_with_name(dsd: DatasetDict, preferred: List[str]) -> Tuple[Dataset, str]:
+    for k in preferred:
+        if k in dsd:
+            return dsd[k], k
+    k = list(dsd.keys())[0]
+    return dsd[k], k
 
 
 def load_sc(task: str) -> Tuple[Dataset, Dataset, int]:
     spec = SC_TASKS[task]
     dsd = load_dataset(spec["path"], spec["name"])
-    # Use GLUE official validation splits
     if task == "sc_mnli":
         train = dsd["train"]
         eval_ds = dsd["validation_matched"]
@@ -88,12 +86,10 @@ def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
     spec = TC_TASKS[task]
 
     if task == "tc_uner_en":
-        # auto-pick an English config (UNER_English-*)
         cfgs = get_dataset_config_names(spec["path"])
         eng = [c for c in cfgs if re.search(r"English", c, re.IGNORECASE)]
         if not eng:
             raise RuntimeError(f"Could not find English config in {spec['path']} configs: {cfgs[:20]}...")
-        # pick the first English config deterministically
         cfg = sorted(eng)[0]
         dsd = load_dataset(spec["path"], cfg)
     else:
@@ -102,7 +98,6 @@ def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
     train = _pick_split(dsd, ["train", "training"])
     eval_ds = _pick_split(dsd, ["validation", "valid", "dev"])
 
-    # find token/label columns
     tok_col, lab_col = None, None
     for a, b in TC_FIELD_CANDIDATES:
         if a in train.column_names and b in train.column_names:
@@ -111,26 +106,25 @@ def load_tc(task: str) -> Tuple[Dataset, Dataset, List[str], Tuple[str, str]]:
     if tok_col is None:
         raise RuntimeError(f"Could not find token/label columns in {task}. columns={train.column_names}")
 
-    # label names
+    # label names: prefer feature metadata (works for conll2003 etc.)
     feat = train.features[lab_col]
-    if hasattr(feat, "feature") and hasattr(feat.feature, "names"):
-        # e.g., Sequence(ClassLabel(...))
-        label_list = list(feat.feature.names)
-    elif hasattr(feat, "names"):
-        # e.g., ClassLabel(...)
-        label_list = list(feat.names)
-    else:
-        # fallback (robust): train[lab_col] is usually List[List[int]]
-        max_id = -1
+    label_list = None
+    try:
+        if hasattr(feat, "feature") and hasattr(feat.feature, "names"):
+            label_list = list(feat.feature.names)
+        elif hasattr(feat, "names"):
+            label_list = list(feat.names)
+    except Exception:
+        label_list = None
+
+    if label_list is None:
+        # fallback: scan (avoid np.max on ragged lists)
+        mx = 0
         for seq in train[lab_col]:
             if not seq:
                 continue
-            m = max(seq)
-            if m > max_id:
-                max_id = m
-        if max_id < 0:
-            max_id = 0
-        label_list = [str(i) for i in range(int(max_id) + 1)]
+            mx = max(mx, max(int(x) for x in seq))
+        label_list = [str(i) for i in range(mx + 1)]
 
     return train, eval_ds, label_list, (tok_col, lab_col)
 
@@ -152,40 +146,54 @@ def load_ir(task: str) -> Dict[str, Any]:
       - corpus: Dataset
       - queries: Dataset
       - qrels: Dataset (if available)
-      - split hints
-    For BeIR/*: subsets are usually "corpus" and "queries" (and sometimes "qrels").
-    We'll try to load them robustly.
+    For some BEIR datasets on HF, qrels are in a separate dataset "<path>-qrels"
+    (e.g., BeIR/msmarco-qrels). :contentReference[oaicite:2]{index=2}
     """
     spec = IR_TASKS[task]
     path = spec["path"]
 
-    def load_subset(subset: str):
+    def try_load_subset(ds_path: str, subset: str):
         try:
-            dd = load_dataset(path, subset)
-            return dd
+            return load_dataset(ds_path, subset)
         except Exception:
             return None
 
     out: Dict[str, Any] = {"path": path, "task": task}
 
-    dd_corpus = load_subset("corpus")
+    # corpus
+    dd_corpus = try_load_subset(path, "corpus")
     if dd_corpus is None:
-        raise RuntimeError(f"Failed to load IR corpus subset for {path}. Try checking HF dataset card.")
+        raise RuntimeError(f"Failed to load IR corpus subset for {path}.")
     out["corpus"] = _pick_split(dd_corpus, ["corpus", "train"])
 
-    dd_queries = load_subset("queries")
+    # queries
+    dd_queries = try_load_subset(path, "queries")
     if dd_queries is None:
         raise RuntimeError(f"Failed to load IR queries subset for {path}.")
-    # prefer "test" if present else "queries"/"train"
-    out["queries"] = _pick_split(dd_queries, ["test", "dev", "validation", "queries", "train"])
+    queries_ds, queries_split = _pick_split_with_name(dd_queries, ["test", "dev", "validation", "queries", "train"])
+    out["queries"] = queries_ds
+    out["queries_split"] = queries_split
 
-    dd_qrels = load_subset("qrels")
+    # qrels: 1) same dataset subset "qrels"  2) fallback to "<path>-qrels"
+    dd_qrels = try_load_subset(path, "qrels")
+
+    if dd_qrels is None:
+        qrels_path = pathpath = path + "-qrels" if not path.endswith("-qrels") else path
+        try:
+            dd_qrels = load_dataset(qrels_path)  # note: no subset
+            out["qrels_path"] = qrels_path
+        except Exception:
+            dd_qrels = None
+
     if dd_qrels is not None:
-        out["qrels"] = _pick_split(dd_qrels, ["test", "dev", "validation", "qrels", "train"])
+        # match split with queries if possible
+        if isinstance(dd_qrels, DatasetDict) and queries_split in dd_qrels:
+            out["qrels"] = dd_qrels[queries_split]
+        else:
+            out["qrels"] = _pick_split(dd_qrels, ["test", "dev", "validation", "qrels", "train"])
     else:
         out["qrels"] = None
 
-    # MLDR is different; user can extend later if needed.
     if task == "ir_mldr_en":
         out["lang"] = spec.get("lang", "en")
 
