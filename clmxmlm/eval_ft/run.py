@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import os
 import json
-import time
 import argparse
 import inspect
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
 
 import numpy as np
 from tqdm import tqdm
@@ -19,8 +18,8 @@ from transformers import (
     Trainer,
     DataCollatorWithPadding,
     DataCollatorForTokenClassification,
-    default_data_collator,
 )
+
 from datasets import Dataset
 import evaluate
 
@@ -614,11 +613,9 @@ def main():
     print("[mask sanity]", sc)
 
     if args.mask_sanity:
-        # just diagnostics
         return
 
     if args.mask_sanity_strict:
-        # strict: bidir must be measurably different from causal
         if not (sc["diff_causal"] < 1e-4 and sc["diff_bidir"] > 1e-3):
             raise RuntimeError(f"Mask sanity failed: {sc}")
 
@@ -652,7 +649,9 @@ def main():
 
         model = DecoderOnlyForTokenClassification(backbone, hidden, num_labels, mask_cfg).to(device)
 
-        train_tok, eval_tok, collator, compute_metrics = build_tc(tok, train_ds, eval_ds, label_list, tok_col, lab_col, args.max_length)
+        train_tok, eval_tok, collator, compute_metrics = build_tc(
+            tok, train_ds, eval_ds, label_list, tok_col, lab_col, args.max_length
+        )
 
         trainer = Trainer(
             model=model,
@@ -672,7 +671,17 @@ def main():
 
         model = DecoderOnlyForExtractiveQA(backbone, hidden, mask_cfg).to(device)
 
-        train_feat, eval_feat = build_qa_features(tok, train_ds, eval_ds, args.task, args.max_length, doc_stride=args.doc_stride)
+        train_feat, eval_feat = build_qa_features(
+            tok, train_ds, eval_ds, args.task, args.max_length, doc_stride=args.doc_stride
+        )
+
+        # Trainer の batching で tensor 化できない列(offset_mapping/example_id)を落とす。
+        # ※ postprocess 用に eval_feat (offset付き) 自体は保持する。
+        drop_cols = [c for c in ("offset_mapping", "example_id") if c in eval_feat.column_names]
+        eval_dataset_for_trainer = eval_feat.remove_columns(drop_cols) if drop_cols else eval_feat
+
+        # 可変長 input_ids をパディングしてバッチ化する
+        qa_collator = DataCollatorWithPadding(tok)
 
         def compute_metrics_for_qa(p):
             preds = postprocess_qa_predictions(eval_ds, eval_feat, p.predictions)
@@ -696,8 +705,8 @@ def main():
             model=model,
             args=targs,
             train_dataset=train_feat,
-            eval_dataset=eval_feat,
-            data_collator=default_data_collator,
+            eval_dataset=eval_dataset_for_trainer,
+            data_collator=qa_collator,
             compute_metrics=compute_metrics_for_qa,
             **_trainer_tokenizer_kw(tok),
         )
