@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import time
-import inspect
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -11,7 +10,7 @@ from transformers import Trainer
 
 from ..masking import get_backbone_from_causallm, MaskController
 from ..modeling import get_lm_head_module, special_ids_from_tokenizer
-from ..data.mlm import build_mlm_batch
+from ..data.mlm import build_mntp_batch  # MNTP
 
 
 def _unwrap_model(model):
@@ -54,18 +53,19 @@ def local_weight_norm(model) -> float:
 
 class DualCLMMLMTrainer(Trainer):
     """
-    CLM+MLM dual-mode Trainer (FlashAttention2-friendly):
+    CLM + MNTP (Masked Next-Token Prediction) dual-mode Trainer (FlashAttention2-friendly):
 
     - Always call BACKBONE directly (e.g., Qwen3Model) and apply lm_head ourselves.
-      This ensures `is_causal` really reaches the attention kernel, as in your successful test.
+      This ensures `is_causal` really reaches the attention kernel.
 
     - For CLM:
         controller.set(True) + backbone_forward(is_causal=True)
         CE on shifted tokens (next-token prediction)
 
-    - For MLM (bidir-ish):
+    - For MNTP (bidir-ish):
         controller.set(False) + backbone_forward(is_causal=False)
-        CE only on masked positions (labels != -100)
+        Replace selected target tokens (k+1) with <mask>,
+        and supervise at previous positions k: label[k] = original_token[k+1].
 
     - attention_mask kept 2D (B,S) to keep FA2 varlen path happy.
     """
@@ -94,14 +94,14 @@ class DualCLMMLMTrainer(Trainer):
         need_mlm = self.mask_policy in ("mlm", "alternate", "both")
         self.mask_token_id = int(mask_token_id) if (need_mlm and mask_token_id is not None) else None
         if need_mlm and self.mask_token_id is None:
-            raise RuntimeError("MLM requires mask_token_id")
+            raise RuntimeError("MNTP requires mask_token_id")
 
         # backbone / head / controller
         self.backbone = get_backbone_from_causallm(self.model)
         self.lm_head = get_lm_head_module(self.model)
         self.controller = MaskController(self.backbone)
 
-        # RNG for MLM masking on device
+        # RNG for masking on device
         dev = next(self.model.parameters()).device
         self._rng = torch.Generator(device=dev)
         base_seed = int(getattr(self.args, "seed", 42))
@@ -115,15 +115,16 @@ class DualCLMMLMTrainer(Trainer):
         # perf stats
         self._n_params = int(sum(p.numel() for p in self.model.parameters()))
         self._reset_interval()
+
         self._step_start_time: Optional[float] = None
         self._micro_in_step: int = 0
         self._pending_grad_stats: Optional[Dict[str, float]] = None
 
         # ---- grad_sim ----
         self.grad_sim_enabled = bool(grad_sim)
-        self._can_grad_sim = (self.mask_policy == "both")  # both のときだけ意味がある想定
+        self._can_grad_sim = (self.mask_policy == "both")
         self._pending_grad_sim: Optional[Dict[str, float]] = None
-        self._last_mlm_xy: Optional[Tuple[torch.Tensor, torch.Tensor]] = None  # (x_mlm, y_mlm)
+        self._last_mlm_xy: Optional[Tuple[torch.Tensor, torch.Tensor]] = None  # (x_mntp, y_mntp)
 
     def _reset_interval(self):
         self._int_micro = 0
@@ -152,6 +153,7 @@ class DualCLMMLMTrainer(Trainer):
         return logits.sum() * 0.0
 
     def _mlm_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        # MNTP labels: same shape (B,S), supervised positions have labels != -100.
         mask = labels != -100
         if not mask.any():
             return logits.sum() * 0.0
@@ -189,20 +191,22 @@ class DualCLMMLMTrainer(Trainer):
             active += int(attention_mask[:, 1:].sum().item())
 
         if mode in ("mlm", "both"):
-            x_mlm, y_mlm, nmask = build_mlm_batch(
+            # ---- MNTP batch ----
+            x_mntp, y_mntp, nmask = build_mntp_batch(
                 input_ids=input_ids,
+                attention_mask=attention_mask,  # avoid selecting pad positions
                 mask_token_id=int(self.mask_token_id),
                 mask_ratio=float(self.mlm_mask_ratio),
                 special_ids=self._special_ids,
                 rng=self._rng,
             )
 
-            # ---- grad_sim 用に「このステップで使った MLM マスク」を保存 ----
+            # ---- grad_sim 用に「このステップで使った MNTP マスク」を保存 ----
             if self.grad_sim_enabled and self._can_grad_sim:
-                self._last_mlm_xy = (x_mlm.detach(), y_mlm.detach())
+                self._last_mlm_xy = (x_mntp.detach(), y_mntp.detach())
 
-            logits = self._backbone_logits(x_mlm, attention_mask, is_causal=False)
-            loss_mlm = self._mlm_loss(logits, y_mlm)
+            logits = self._backbone_logits(x_mntp, attention_mask, is_causal=False)
+            loss_mlm = self._mlm_loss(logits, y_mntp)
             active += int(nmask)
 
         if mode == "clm":
@@ -230,7 +234,7 @@ class DualCLMMLMTrainer(Trainer):
 
     def _compute_grad_sim_all_params(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """
-        grad_sim: cosine similarity between grad(loss_clm) and grad(loss_mlm).
+        grad_sim: cosine similarity between grad(loss_clm) and grad(loss_mntp).
         - 追加の forward + autograd.grad を行う（=重い）
         - .grad を汚さない（autograd.gradなので optimizer 勾配には影響しない）
         """
@@ -249,20 +253,21 @@ class DualCLMMLMTrainer(Trainer):
                 logits_c = self._backbone_logits(input_ids, attention_mask, is_causal=True)
                 loss_clm = self._clm_loss(logits_c, input_ids, attention_mask)
 
-                # ---- MLM (保存しておいたマスクがあればそれを使う) ----
+                # ---- MNTP (保存しておいたマスクがあればそれを使う) ----
                 if self._last_mlm_xy is not None:
-                    x_mlm, y_mlm = self._last_mlm_xy
+                    x_mntp, y_mntp = self._last_mlm_xy
                 else:
-                    x_mlm, y_mlm, _ = build_mlm_batch(
+                    x_mntp, y_mntp, _ = build_mntp_batch(
                         input_ids=input_ids,
+                        attention_mask=attention_mask,
                         mask_token_id=int(self.mask_token_id),
                         mask_ratio=float(self.mlm_mask_ratio),
                         special_ids=self._special_ids,
                         rng=self._rng,
                     )
 
-                logits_m = self._backbone_logits(x_mlm, attention_mask, is_causal=False)
-                loss_mlm = self._mlm_loss(logits_m, y_mlm)
+                logits_m = self._backbone_logits(x_mntp, attention_mask, is_causal=False)
+                loss_mlm = self._mlm_loss(logits_m, y_mntp)
 
             grads_c = torch.autograd.grad(loss_clm, params, allow_unused=True)
             grads_m = torch.autograd.grad(loss_mlm, params, allow_unused=True)
@@ -310,7 +315,6 @@ class DualCLMMLMTrainer(Trainer):
 
         out["grad_sim_ms"] = (time.time() - t0) * 1000.0
         return out
-
 
     def _compute_lr(self) -> float:
         try:
@@ -432,7 +436,6 @@ class DualCLMMLMTrainer(Trainer):
             out["grad_sim_ms"] = round(float(gs.get("grad_sim_ms", 0.0)), 2)
             out["grad_sim_oom"] = float(gs.get("grad_sim_oom", 0.0))
             self._pending_grad_sim = None
-
 
         self._reset_interval()
 
